@@ -724,7 +724,7 @@ async function loginWithTenantFallback(ctx: ProviderAuthContext): Promise<{
     const message = error instanceof Error ? error.message : String(error);
     const isAzureTenantError =
       /AADSTS/i.test(message) ||
-      /no subscriptions found/i.test(message) ||
+        return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(trimmed) ? undefined : "Enter a valid tenant ID";
       /tenant/i.test(message);
     if (!isAzureTenantError) {
       throw error;
