@@ -1,14 +1,19 @@
-import { execSync, spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
   definePluginEntry,
   type ProviderAuthContext,
+  type ProviderAuthMethod,
 } from "openclaw/plugin-sdk/core";
 import {
   applyAuthProfileConfig,
-  createProviderApiKeyAuthMethod,
+  buildApiKeyCredential,
   ensureAuthProfileStore,
-  upsertAuthProfile,
+  ensureApiKeyFromOptionEnvOrPrompt,
+  normalizeApiKeyInput,
+  normalizeOptionalSecretInput,
   type ProviderAuthResult,
+  type SecretInput,
+  validateApiKeyInput,
 } from "openclaw/plugin-sdk/provider-auth";
 import type { ModelCompatConfig, ModelProviderConfig } from "../../src/config/types.models.js";
 import type { ProviderModelSelectedContext } from "../../src/plugins/types.js";
@@ -23,14 +28,18 @@ const TOKEN_REFRESH_MARGIN_MS = 5 * 60 * 1000; // refresh 5 min before expiry
 // Helpers
 // ---------------------------------------------------------------------------
 
-function execCmd(cmd: string): string {
-  return execSync(cmd, { encoding: "utf-8", timeout: 30_000 }).trim();
+function execAz(args: string[]): string {
+  return execFileSync("az", args, {
+    encoding: "utf-8",
+    timeout: 30_000,
+    shell: process.platform === "win32",
+  }).trim();
 }
 
 function isAzCliInstalled(): boolean {
   try {
     // "az version" works on Windows, Linux, and macOS
-    execCmd("az version --output none");
+    execAz(["version", "--output", "none"]);
     return true;
   } catch {
     return false;
@@ -48,7 +57,7 @@ interface AzAccount {
 
 function getLoggedInAccount(): AzAccount | null {
   try {
-    const raw = execCmd("az account show --output json");
+    const raw = execAz(["account", "show", "--output", "json"]);
     return JSON.parse(raw) as AzAccount;
   } catch {
     return null;
@@ -57,7 +66,7 @@ function getLoggedInAccount(): AzAccount | null {
 
 function listSubscriptions(): AzAccount[] {
   try {
-    const raw = execCmd("az account list --output json --all");
+    const raw = execAz(["account", "list", "--output", "json", "--all"]);
     const subs = JSON.parse(raw) as AzAccount[];
     return subs.filter((s) => s.state === "Enabled");
   } catch {
@@ -99,25 +108,46 @@ interface AzDeploymentSummary {
   sku?: string;
 }
 
-type FoundryProviderApi = typeof DEFAULT_API | typeof DEFAULT_GPT5_API;
+type FoundrySelection = {
+  endpoint: string;
+  modelId: string;
+  modelNameHint?: string;
+};
 
-function quoteShellArg(value: string): string {
-  return JSON.stringify(value);
-}
+type CachedTokenEntry = {
+  token: string;
+  expiresAt: number;
+};
+
+type FoundryProviderApi = typeof DEFAULT_API | typeof DEFAULT_GPT5_API;
 
 function getAccessTokenResult(params?: {
   subscriptionId?: string;
   tenantId?: string;
 }): AzAccessToken {
-  const targetArg = params?.subscriptionId
-    ? ` --subscription ${JSON.stringify(params.subscriptionId)}`
-    : params?.tenantId
-      ? ` --tenant ${JSON.stringify(params.tenantId)}`
-      : "";
-  const raw = execCmd(
-    `az account get-access-token --resource ${COGNITIVE_SERVICES_RESOURCE} --output json${targetArg}`,
-  );
+  const args = [
+    "account",
+    "get-access-token",
+    "--resource",
+    COGNITIVE_SERVICES_RESOURCE,
+    "--output",
+    "json",
+  ];
+  if (params?.subscriptionId) {
+    args.push("--subscription", params.subscriptionId);
+  } else if (params?.tenantId) {
+    args.push("--tenant", params.tenantId);
+  }
+  const raw = execAz(args);
   return JSON.parse(raw) as AzAccessToken;
+}
+
+function isGpt5FamilyName(value?: string | null): boolean {
+  return typeof value === "string" && /^gpt-5(?:$|[-.])/i.test(value.trim());
+}
+
+function isGpt5FamilyDeployment(modelId: string, modelNameHint?: string | null): boolean {
+  return isGpt5FamilyName(modelId) || isGpt5FamilyName(modelNameHint);
 }
 
 function buildAzureBaseUrl(endpoint: string, modelId: string): string {
@@ -136,8 +166,12 @@ function normalizeFoundryEndpoint(endpoint: string): string {
   return trimmed.replace(/\/openai(?:\/v1|\/deployments\/[^/]+)?$/i, "");
 }
 
-function buildFoundryProviderBaseUrl(endpoint: string, modelId: string): string {
-  return resolveFoundryApi(modelId) === DEFAULT_GPT5_API
+function buildFoundryProviderBaseUrl(
+  endpoint: string,
+  modelId: string,
+  modelNameHint?: string | null,
+): string {
+  return resolveFoundryApi(modelId, modelNameHint) === DEFAULT_GPT5_API
     ? buildFoundryResponsesBaseUrl(endpoint)
     : buildAzureBaseUrl(endpoint, modelId);
 }
@@ -151,16 +185,15 @@ function extractFoundryEndpoint(baseUrl: string): string | undefined {
   }
 }
 
-function isGpt5FamilyDeployment(modelId: string): boolean {
-  return /^gpt-5(?:$|[-.])/i.test(modelId.trim());
+function resolveFoundryApi(modelId: string, modelNameHint?: string | null): FoundryProviderApi {
+  return isGpt5FamilyDeployment(modelId, modelNameHint) ? DEFAULT_GPT5_API : DEFAULT_API;
 }
 
-function resolveFoundryApi(modelId: string): FoundryProviderApi {
-  return isGpt5FamilyDeployment(modelId) ? DEFAULT_GPT5_API : DEFAULT_API;
-}
-
-function buildFoundryModelCompat(modelId: string): ModelCompatConfig | undefined {
-  if (!isGpt5FamilyDeployment(modelId)) {
+function buildFoundryModelCompat(
+  modelId: string,
+  modelNameHint?: string | null,
+): ModelCompatConfig | undefined {
+  if (!isGpt5FamilyDeployment(modelId, modelNameHint)) {
     return undefined;
   }
   return {
@@ -168,15 +201,19 @@ function buildFoundryModelCompat(modelId: string): ModelCompatConfig | undefined
   };
 }
 
-function buildFoundryProviderConfig(endpoint: string, modelId: string): ModelProviderConfig {
-  const compat = buildFoundryModelCompat(modelId);
+function buildFoundryProviderConfig(
+  endpoint: string,
+  modelId: string,
+  modelNameHint?: string | null,
+): ModelProviderConfig {
+  const compat = buildFoundryModelCompat(modelId, modelNameHint);
   return {
-    baseUrl: buildFoundryProviderBaseUrl(endpoint, modelId),
-    api: resolveFoundryApi(modelId),
+    baseUrl: buildFoundryProviderBaseUrl(endpoint, modelId, modelNameHint),
+    api: resolveFoundryApi(modelId, modelNameHint),
     models: [
       {
         id: modelId,
-        name: modelId,
+        name: typeof modelNameHint === "string" && modelNameHint.trim().length > 0 ? modelNameHint.trim() : modelId,
         reasoning: false,
         input: ["text"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -199,11 +236,125 @@ function normalizeEndpointOrigin(rawUrl: string | null | undefined): string | un
   }
 }
 
+function resolveConfiguredModelNameHint(modelId: string, modelNameHint?: string | null): string | undefined {
+  const trimmedName = typeof modelNameHint === "string" ? modelNameHint.trim() : "";
+  if (trimmedName) {
+    return trimmedName;
+  }
+  const trimmedId = modelId.trim();
+  return trimmedId ? trimmedId : undefined;
+}
+
+function buildFoundryCredentialMetadata(params: {
+  authMethod: "api-key" | "entra-id";
+  endpoint: string;
+  modelId: string;
+  modelNameHint?: string | null;
+  subscriptionId?: string;
+  subscriptionName?: string;
+  tenantId?: string;
+}): Record<string, string> {
+  const metadata: Record<string, string> = {
+    authMethod: params.authMethod,
+    endpoint: params.endpoint,
+    modelId: params.modelId,
+  };
+  const modelName = resolveConfiguredModelNameHint(params.modelId, params.modelNameHint);
+  if (modelName) {
+    metadata.modelName = modelName;
+  }
+  if (params.subscriptionId) {
+    metadata.subscriptionId = params.subscriptionId;
+  }
+  if (params.subscriptionName) {
+    metadata.subscriptionName = params.subscriptionName;
+  }
+  if (params.tenantId) {
+    metadata.tenantId = params.tenantId;
+  }
+  return metadata;
+}
+
+function buildFoundryAuthResult(params: {
+  profileId: string;
+  apiKey: SecretInput;
+  secretInputMode?: "plaintext" | "ref";
+  endpoint: string;
+  modelId: string;
+  modelNameHint?: string | null;
+  authMethod: "api-key" | "entra-id";
+  subscriptionId?: string;
+  subscriptionName?: string;
+  tenantId?: string;
+  notes?: string[];
+}): ProviderAuthResult {
+  return {
+    profiles: [
+      {
+        profileId: params.profileId,
+        credential: buildApiKeyCredential(
+          PROVIDER_ID,
+          params.apiKey,
+          buildFoundryCredentialMetadata({
+            authMethod: params.authMethod,
+            endpoint: params.endpoint,
+            modelId: params.modelId,
+            modelNameHint: params.modelNameHint,
+            subscriptionId: params.subscriptionId,
+            subscriptionName: params.subscriptionName,
+            tenantId: params.tenantId,
+          }),
+          params.secretInputMode ? { secretInputMode: params.secretInputMode } : undefined,
+        ),
+      },
+    ],
+    configPatch: {
+      models: {
+        providers: {
+          [PROVIDER_ID]: buildFoundryProviderConfig(
+            params.endpoint,
+            params.modelId,
+            params.modelNameHint,
+          ),
+        },
+      },
+    },
+    defaultModel: `${PROVIDER_ID}/${params.modelId}`,
+    notes: params.notes,
+  };
+}
+
+function applyFoundryProfileBinding(
+  config: ProviderModelSelectedContext["config"],
+  profileId: string,
+): void {
+  applyAuthProfileConfig(config, {
+    profileId,
+    provider: PROVIDER_ID,
+    mode: "api_key",
+  });
+}
+
+function applyFoundryProviderConfig(
+  config: ProviderModelSelectedContext["config"],
+  providerConfig: ModelProviderConfig,
+): void {
+  config.models ??= {};
+  config.models.providers ??= {};
+  config.models.providers[PROVIDER_ID] = providerConfig;
+}
+
 function listFoundryResources(): FoundryResourceOption[] {
   try {
-    const raw = execCmd(
-      'az cognitiveservices account list --query "[].{id:id,name:name,kind:kind,location:location,resourceGroup:resourceGroup,endpoint:properties.endpoint,customSubdomain:properties.customSubDomainName,projects:properties.associatedProjects}" --output json',
-    );
+    const raw = execAz([
+      "cognitiveservices",
+      "account",
+      "list",
+      "--query",
+      "[].{id:id,name:name,kind:kind,location:location,resourceGroup:resourceGroup,endpoint:properties.endpoint,customSubdomain:properties.customSubDomainName,projects:properties.associatedProjects}",
+      "--output",
+      "json",
+    ]);
     const accounts = JSON.parse(raw) as AzCognitiveAccount[];
     const resources: FoundryResourceOption[] = [];
     for (const account of accounts) {
@@ -255,9 +406,20 @@ function listFoundryResources(): FoundryResourceOption[] {
 
 function listResourceDeployments(resource: FoundryResourceOption): AzDeploymentSummary[] {
   try {
-    const raw = execCmd(
-      `az cognitiveservices account deployment list -g ${quoteShellArg(resource.resourceGroup)} -n ${quoteShellArg(resource.accountName)} --query "[].{name:name,modelName:properties.model.name,modelVersion:properties.model.version,state:properties.provisioningState,sku:sku.name}" --output json`,
-    );
+    const raw = execAz([
+      "cognitiveservices",
+      "account",
+      "deployment",
+      "list",
+      "-g",
+      resource.resourceGroup,
+      "-n",
+      resource.accountName,
+      "--query",
+      "[].{name:name,modelName:properties.model.name,modelVersion:properties.model.version,state:properties.provisioningState,sku:sku.name}",
+      "--output",
+      "json",
+    ]);
     const deployments = JSON.parse(raw) as AzDeploymentSummary[];
     return deployments.filter((deployment) => deployment.state === "Succeeded");
   } catch {
@@ -338,6 +500,7 @@ function buildCreateFoundryHint(selectedSub: AzAccount): string {
 async function promptEndpointAndModelManually(ctx: ProviderAuthContext): Promise<{
   endpoint: string;
   modelId: string;
+  modelNameHint?: string;
 }> {
   const endpoint = String(
     await ctx.prompter.text({
@@ -366,7 +529,86 @@ async function promptEndpointAndModelManually(ctx: ProviderAuthContext): Promise
       },
     }),
   ).trim();
-  return { endpoint, modelId };
+  return { endpoint, modelId, modelNameHint: modelId };
+}
+
+async function promptApiKeyEndpointAndModel(ctx: ProviderAuthContext): Promise<FoundrySelection> {
+  const endpoint = String(
+    await ctx.prompter.text({
+      message: "Microsoft Foundry endpoint URL",
+      placeholder: "https://xxx.openai.azure.com or https://xxx.services.ai.azure.com",
+      initialValue: normalizeOptionalSecretInput(process.env.AZURE_OPENAI_ENDPOINT),
+      validate: (v) => {
+        const val = String(v ?? "").trim();
+        if (!val) return "Endpoint URL is required";
+        try {
+          new URL(val);
+        } catch {
+          return "Invalid URL";
+        }
+        return undefined;
+      },
+    }),
+  ).trim();
+  const modelId = String(
+    await ctx.prompter.text({
+      message: "Default model/deployment name",
+      initialValue: "gpt-4o",
+      validate: (v) => {
+        const val = String(v ?? "").trim();
+        if (!val) return "Model ID is required";
+        return undefined;
+      },
+    }),
+  ).trim();
+  const modelNameHintInput = String(
+    await ctx.prompter.text({
+      message: "Underlying Azure model family (optional)",
+      initialValue: modelId,
+      placeholder: "gpt-5.4, gpt-4o, etc.",
+    }),
+  ).trim();
+  return {
+    endpoint,
+    modelId,
+    modelNameHint: modelNameHintInput || modelId,
+  };
+}
+
+function buildFoundryConnectionTest(params: {
+  endpoint: string;
+  modelId: string;
+  modelNameHint?: string | null;
+}): { url: string; body: Record<string, unknown> } {
+  const baseUrl = buildFoundryProviderBaseUrl(
+    params.endpoint,
+    params.modelId,
+    params.modelNameHint,
+  );
+  if (resolveFoundryApi(params.modelId, params.modelNameHint) === DEFAULT_GPT5_API) {
+    return {
+      url: `${baseUrl}/responses?api-version=2025-04-01-preview`,
+      body: {
+        model: params.modelId,
+        input: "hi",
+        max_output_tokens: 1,
+      },
+    };
+  }
+  return {
+    url: `${baseUrl}/chat/completions?api-version=2024-12-01-preview`,
+    body: {
+      messages: [{ role: "user", content: "hi" }],
+      max_tokens: 1,
+    },
+  };
+}
+
+function getFoundryTokenCacheKey(params?: {
+  subscriptionId?: string;
+  tenantId?: string;
+}): string {
+  return `${params?.subscriptionId ?? ""}:${params?.tenantId ?? ""}`;
 }
 
 /**
@@ -570,12 +812,13 @@ const entraIdAuthMethod = {
 
     // 4. Set subscription
     if (selectedSub) {
-      execCmd(`az account set --subscription "${selectedSub.id}"`);
+      execAz(["account", "set", "--subscription", selectedSub.id]);
     }
 
     // 5. Discover resource + deployment when possible
     let endpoint: string;
     let modelId: string;
+    let modelNameHint: string | undefined;
     if (selectedSub) {
       const useDiscoveredResource = await ctx.prompter.confirm({
         message: "Discover Microsoft Foundry resources from this subscription?",
@@ -586,19 +829,21 @@ const entraIdAuthMethod = {
         const selectedDeployment = await selectFoundryDeployment(ctx, selectedResource);
         endpoint = selectedResource.endpoint;
         modelId = selectedDeployment.name;
+        modelNameHint = resolveConfiguredModelNameHint(modelId, selectedDeployment.modelName);
         await ctx.prompter.note(
           [
             `Resource: ${selectedResource.accountName}`,
             `Endpoint: ${endpoint}`,
             `Deployment: ${modelId}`,
+            selectedDeployment.modelName ? `Model: ${selectedDeployment.modelName}` : undefined,
           ].join("\n"),
           "Microsoft Foundry",
         );
       } else {
-        ({ endpoint, modelId } = await promptEndpointAndModelManually(ctx));
+        ({ endpoint, modelId, modelNameHint } = await promptEndpointAndModelManually(ctx));
       }
     } else {
-      ({ endpoint, modelId } = await promptEndpointAndModelManually(ctx));
+      ({ endpoint, modelId, modelNameHint } = await promptEndpointAndModelManually(ctx));
     }
 
     // 7. Test connection
@@ -607,17 +852,18 @@ const entraIdAuthMethod = {
         subscriptionId: selectedSub?.id,
         tenantId,
       });
-      const testUrl = `${buildAzureBaseUrl(endpoint, modelId)}/chat/completions?api-version=2024-12-01-preview`;
-      const res = await fetch(testUrl, {
+      const testRequest = buildFoundryConnectionTest({
+        endpoint,
+        modelId,
+        modelNameHint,
+      });
+      const res = await fetch(testRequest.url, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${accessToken}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          messages: [{ role: "user", content: "hi" }],
-          max_tokens: 1,
-        }),
+        body: JSON.stringify(testRequest.body),
       });
       if (!res.ok && res.status !== 400) {
         const body = await res.text().catch(() => "");
@@ -639,34 +885,16 @@ const entraIdAuthMethod = {
     //    replace it with a fresh Entra ID token at request time.
     const profileId = `${PROVIDER_ID}:entra`;
 
-    return {
-      profiles: [
-        {
-          profileId,
-          credential: {
-            type: "api_key",
-            provider: PROVIDER_ID,
-            // Placeholder — prepareRuntimeAuth refreshes this dynamically.
-            key: "__entra_id_dynamic__",
-            metadata: {
-              authMethod: "entra-id",
-              ...(selectedSub?.id ? { subscriptionId: selectedSub.id } : {}),
-              ...(selectedSub?.name ? { subscriptionName: selectedSub.name } : {}),
-              ...(tenantId ? { tenantId } : {}),
-              endpoint,
-              modelId,
-            },
-          },
-        },
-      ],
-      configPatch: {
-        models: {
-          providers: {
-            [PROVIDER_ID]: buildFoundryProviderConfig(endpoint, modelId),
-          },
-        },
-      },
-      defaultModel: `${PROVIDER_ID}/${modelId}`,
+    return buildFoundryAuthResult({
+      profileId,
+      apiKey: "__entra_id_dynamic__",
+      endpoint,
+      modelId,
+      modelNameHint,
+      authMethod: "entra-id",
+      ...(selectedSub?.id ? { subscriptionId: selectedSub.id } : {}),
+      ...(selectedSub?.name ? { subscriptionName: selectedSub.name } : {}),
+      ...(tenantId ? { tenantId } : {}),
       notes: [
         ...(selectedSub?.name ? [`Subscription: ${selectedSub.name}`] : []),
         ...(tenantId ? [`Tenant: ${tenantId}`] : []),
@@ -674,7 +902,7 @@ const entraIdAuthMethod = {
         `Model: ${modelId}`,
         "Token is refreshed automatically via az CLI — keep az login active.",
       ],
-    };
+    });
   },
   onModelSelected: async (ctx: ProviderModelSelectedContext) => {
     const providerConfig = ctx.config.models?.providers?.[PROVIDER_ID];
@@ -682,15 +910,20 @@ const entraIdAuthMethod = {
       return;
     }
     const selectedModelId = ctx.model.slice(`${PROVIDER_ID}/`.length);
-    const selectedModelCompat = buildFoundryModelCompat(selectedModelId);
+    const existingModel = providerConfig.models.find((model: { id: string }) => model.id === selectedModelId);
+    const selectedModelNameHint = resolveConfiguredModelNameHint(
+      selectedModelId,
+      existingModel?.name,
+    );
+    const selectedModelCompat = buildFoundryModelCompat(selectedModelId, selectedModelNameHint);
     const providerEndpoint = normalizeFoundryEndpoint(providerConfig.baseUrl ?? "");
     const nextProviderConfig: ModelProviderConfig = {
       ...providerConfig,
-      baseUrl: buildFoundryProviderBaseUrl(providerEndpoint, selectedModelId),
-      api: resolveFoundryApi(selectedModelId),
+      baseUrl: buildFoundryProviderBaseUrl(providerEndpoint, selectedModelId, selectedModelNameHint),
+      api: resolveFoundryApi(selectedModelId, selectedModelNameHint),
       models: [
         {
-          ...(providerConfig.models.find((model: { id: string }) => model.id === selectedModelId) ?? {
+          ...(existingModel ?? {
             id: selectedModelId,
             name: selectedModelId,
             reasoning: false,
@@ -703,14 +936,8 @@ const entraIdAuthMethod = {
         },
       ],
     };
-    applyAuthProfileConfig(ctx.config, {
-      profileId: `${PROVIDER_ID}:entra`,
-      provider: PROVIDER_ID,
-      mode: "api_key",
-    });
-    ctx.config.models ??= {};
-    ctx.config.models.providers ??= {};
-    ctx.config.models.providers[PROVIDER_ID] = nextProviderConfig;
+    applyFoundryProfileBinding(ctx.config, `${PROVIDER_ID}:entra`);
+    applyFoundryProviderConfig(ctx.config, nextProviderConfig);
   },
 };
 
@@ -718,17 +945,11 @@ const entraIdAuthMethod = {
 // API Key auth method
 // ---------------------------------------------------------------------------
 
-const apiKeyAuthMethod = createProviderApiKeyAuthMethod({
-  providerId: PROVIDER_ID,
-  methodId: "api-key",
+const apiKeyAuthMethod: ProviderAuthMethod = {
+  id: "api-key",
   label: "Azure OpenAI API key",
   hint: "Direct Azure OpenAI API key",
-  optionKey: "azureOpenaiApiKey",
-  flagName: "--azure-openai-api-key",
-  envVar: "AZURE_OPENAI_API_KEY",
-  promptMessage: "Enter Azure OpenAI API key",
-  defaultModel: `${PROVIDER_ID}/gpt-4o`,
-  expectedProviders: [PROVIDER_ID],
+  kind: "api_key",
   wizard: {
     choiceId: "microsoft-foundry-apikey",
     choiceLabel: "Microsoft Foundry (API key)",
@@ -736,13 +957,60 @@ const apiKeyAuthMethod = createProviderApiKeyAuthMethod({
     groupLabel: "Microsoft Foundry",
     groupHint: "Entra ID + API key",
   },
-});
+  run: async (ctx) => {
+    const authStore = ensureAuthProfileStore(ctx.agentDir, {
+      allowKeychainPrompt: false,
+    });
+    const existing = authStore.profiles[`${PROVIDER_ID}:default`];
+    const existingMetadata = existing?.type === "api_key" ? existing.metadata : undefined;
+    let capturedSecretInput: SecretInput | undefined;
+    let capturedCredential = false;
+    let capturedMode: "plaintext" | "ref" | undefined;
+    await ensureApiKeyFromOptionEnvOrPrompt({
+      token: normalizeOptionalSecretInput(ctx.opts?.azureOpenaiApiKey),
+      tokenProvider: PROVIDER_ID,
+      secretInputMode:
+        ctx.allowSecretRefPrompt === false ? (ctx.secretInputMode ?? "plaintext") : ctx.secretInputMode,
+      config: ctx.config,
+      expectedProviders: [PROVIDER_ID],
+      provider: PROVIDER_ID,
+      envLabel: "AZURE_OPENAI_API_KEY",
+      promptMessage: "Enter Azure OpenAI API key",
+      normalize: normalizeApiKeyInput,
+      validate: validateApiKeyInput,
+      prompter: ctx.prompter,
+      setCredential: async (apiKey, mode) => {
+        capturedSecretInput = apiKey;
+        capturedCredential = true;
+        capturedMode = mode;
+      },
+    });
+    if (!capturedCredential) {
+      throw new Error("Missing Azure OpenAI API key.");
+    }
+    const selection = await promptApiKeyEndpointAndModel(ctx);
+    return buildFoundryAuthResult({
+      profileId: `${PROVIDER_ID}:default`,
+      apiKey: capturedSecretInput ?? "",
+      ...(capturedMode ? { secretInputMode: capturedMode } : {}),
+      endpoint: selection.endpoint,
+      modelId: selection.modelId,
+      modelNameHint:
+        selection.modelNameHint ?? existingMetadata?.modelName ?? existingMetadata?.modelId,
+      authMethod: "api-key",
+      notes: [
+        `Endpoint: ${selection.endpoint}`,
+        `Model: ${selection.modelId}`,
+      ],
+    });
+  },
+};
 
 // ---------------------------------------------------------------------------
 // Token cache for prepareRuntimeAuth
 // ---------------------------------------------------------------------------
 
-let cachedToken: { token: string; expiresAt: number } | null = null;
+const cachedTokens = new Map<string, CachedTokenEntry>();
 
 function refreshEntraToken(params?: {
   subscriptionId?: string;
@@ -752,7 +1020,10 @@ function refreshEntraToken(params?: {
   const expiresAt = result.expiresOn
     ? new Date(result.expiresOn).getTime()
     : Date.now() + 55 * 60 * 1000; // default ~55 min
-  cachedToken = { token: result.accessToken, expiresAt };
+  cachedTokens.set(getFoundryTokenCacheKey(params), {
+    token: result.accessToken,
+    expiresAt,
+  });
   return { apiKey: result.accessToken, expiresAt };
 }
 
@@ -779,11 +1050,12 @@ export default definePluginEntry({
         if (!endpoint) {
           return model;
         }
-        const compat = buildFoundryModelCompat(modelId);
+        const modelNameHint = resolveConfiguredModelNameHint(modelId, model.name);
+        const compat = buildFoundryModelCompat(modelId, modelNameHint);
         return {
           ...model,
-          api: resolveFoundryApi(modelId),
-          baseUrl: buildFoundryProviderBaseUrl(endpoint, modelId),
+          api: resolveFoundryApi(modelId, modelNameHint),
+          baseUrl: buildFoundryProviderBaseUrl(endpoint, modelId, modelNameHint),
           ...(compat ? { compat } : {}),
         };
       },
@@ -807,11 +1079,19 @@ export default definePluginEntry({
               : typeof metadata?.modelId === "string" && metadata.modelId.trim().length > 0
                 ? metadata.modelId.trim()
                 : ctx.modelId;
+          const modelNameHint = resolveConfiguredModelNameHint(modelId, metadata?.modelName ?? ctx.model.name);
           const endpoint =
             typeof metadata?.endpoint === "string" && metadata.endpoint.trim().length > 0
               ? metadata.endpoint.trim()
               : extractFoundryEndpoint(ctx.model.baseUrl ?? "");
-          const baseUrl = endpoint ? buildFoundryProviderBaseUrl(endpoint, modelId) : undefined;
+          const baseUrl = endpoint
+            ? buildFoundryProviderBaseUrl(endpoint, modelId, modelNameHint)
+            : undefined;
+          const cacheKey = getFoundryTokenCacheKey({
+            subscriptionId: metadata?.subscriptionId,
+            tenantId: metadata?.tenantId,
+          });
+          const cachedToken = cachedTokens.get(cacheKey);
 
           // Return cached token if still valid
           if (cachedToken && cachedToken.expiresAt > Date.now() + TOKEN_REFRESH_MARGIN_MS) {
