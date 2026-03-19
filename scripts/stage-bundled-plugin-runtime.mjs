@@ -7,13 +7,32 @@ function symlinkType() {
   return process.platform === "win32" ? "junction" : "dir";
 }
 
+function shouldFallbackToWindowsFileLink(error, type) {
+  return (
+    process.platform === "win32" &&
+    type !== symlinkType() &&
+    error &&
+    typeof error === "object" &&
+    "code" in error &&
+    (error.code === "EPERM" || error.code === "EACCES")
+  );
+}
+
 function relativeSymlinkTarget(sourcePath, targetPath) {
   const relativeTarget = path.relative(path.dirname(targetPath), sourcePath);
   return relativeTarget || ".";
 }
 
 function symlinkPath(sourcePath, targetPath, type) {
-  fs.symlinkSync(relativeSymlinkTarget(sourcePath, targetPath), targetPath, type);
+  try {
+    fs.symlinkSync(relativeSymlinkTarget(sourcePath, targetPath), targetPath, type);
+  } catch (error) {
+    if (shouldFallbackToWindowsFileLink(error, type)) {
+      fs.linkSync(sourcePath, targetPath);
+      return;
+    }
+    throw error;
+  }
 }
 
 function shouldWrapRuntimeJsFile(sourcePath) {
