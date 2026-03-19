@@ -1,6 +1,7 @@
 import { execSync, spawn } from "node:child_process";
 import {
   definePluginEntry,
+  type OpenClawConfig,
   type ProviderAuthContext,
 } from "openclaw/plugin-sdk/core";
 import {
@@ -10,8 +11,17 @@ import {
   upsertAuthProfile,
   type ProviderAuthResult,
 } from "openclaw/plugin-sdk/provider-auth";
-import type { ModelCompatConfig, ModelProviderConfig } from "../../src/config/types.models.js";
-import type { ProviderModelSelectedContext } from "../../src/plugins/types.js";
+import type { ModelProviderConfig } from "openclaw/plugin-sdk/provider-models";
+
+// These types are not yet exported from the plugin SDK.
+// Inline minimal shapes to avoid fragile relative imports into src/.
+type ProviderModelSelectedContext = {
+  config: OpenClawConfig;
+  model: string;
+  prompter: unknown;
+  agentDir?: string;
+  workspaceDir?: string;
+};
 
 const PROVIDER_ID = "microsoft-foundry";
 const DEFAULT_API = "openai-completions";
@@ -159,7 +169,7 @@ function resolveFoundryApi(modelId: string): FoundryProviderApi {
   return isGpt5FamilyDeployment(modelId) ? DEFAULT_GPT5_API : DEFAULT_API;
 }
 
-function buildFoundryModelCompat(modelId: string): ModelCompatConfig | undefined {
+function buildFoundryModelCompat(modelId: string): Record<string, unknown> | undefined {
   if (!isGpt5FamilyDeployment(modelId)) {
     return undefined;
   }
@@ -320,10 +330,14 @@ async function selectFoundryDeployment(
     options: deployments.map((deployment) => ({
       value: deployment.name,
       label: deployment.name,
-      hint: [deployment.modelName, deployment.modelVersion, deployment.sku].filter(Boolean).join(" | "),
+      hint: [deployment.modelName, deployment.modelVersion, deployment.sku]
+        .filter(Boolean)
+        .join(" | "),
     })),
   });
-  return deployments.find((deployment) => deployment.name === selectedDeploymentName) ?? deployments[0]!;
+  return (
+    deployments.find((deployment) => deployment.name === selectedDeploymentName) ?? deployments[0]!
+  );
 }
 
 function buildCreateFoundryHint(selectedSub: AzAccount): string {
@@ -444,9 +458,7 @@ async function promptTenantId(
   }
   const tenantId = String(
     await ctx.prompter.text({
-      message: params?.required
-        ? "Azure tenant ID"
-        : "Azure tenant ID (optional)",
+      message: params?.required ? "Azure tenant ID" : "Azure tenant ID (optional)",
       placeholder: params?.suggestions?.[0]?.id ?? "00000000-0000-0000-0000-000000000000",
       validate: (value) => {
         const trimmed = String(value ?? "").trim();
@@ -544,10 +556,7 @@ const entraIdAuthMethod = {
         reason:
           "No enabled Azure subscriptions were found. Continue with tenant-scoped Entra ID auth instead.",
       });
-      await ctx.prompter.note(
-        `Continuing with tenant-scoped auth (${tenantId}).`,
-        "Azure Tenant",
-      );
+      await ctx.prompter.note(`Continuing with tenant-scoped auth (${tenantId}).`, "Azure Tenant");
     } else if (subs.length === 1) {
       selectedSub = subs[0]!;
       tenantId ??= selectedSub.tenantId;
@@ -690,7 +699,9 @@ const entraIdAuthMethod = {
       api: resolveFoundryApi(selectedModelId),
       models: [
         {
-          ...(providerConfig.models.find((model: { id: string }) => model.id === selectedModelId) ?? {
+          ...(providerConfig.models.find(
+            (model: { id: string }) => model.id === selectedModelId,
+          ) ?? {
             id: selectedModelId,
             name: selectedModelId,
             reasoning: false,
@@ -744,10 +755,10 @@ const apiKeyAuthMethod = createProviderApiKeyAuthMethod({
 
 let cachedToken: { token: string; expiresAt: number } | null = null;
 
-function refreshEntraToken(params?: {
-  subscriptionId?: string;
-  tenantId?: string;
-}): { apiKey: string; expiresAt: number } {
+function refreshEntraToken(params?: { subscriptionId?: string; tenantId?: string }): {
+  apiKey: string;
+  expiresAt: number;
+} {
   const result = getAccessTokenResult(params);
   const expiresAt = result.expiresOn
     ? new Date(result.expiresOn).getTime()
