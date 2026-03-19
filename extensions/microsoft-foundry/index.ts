@@ -529,7 +529,18 @@ async function promptEndpointAndModelManually(ctx: ProviderAuthContext): Promise
       },
     }),
   ).trim();
-  return { endpoint, modelId, modelNameHint: modelId };
+  const modelNameHintInput = String(
+    await ctx.prompter.text({
+      message: "Underlying Azure model family (optional)",
+      initialValue: modelId,
+      placeholder: "gpt-5.4, gpt-4o, etc.",
+    }),
+  ).trim();
+  return {
+    endpoint,
+    modelId,
+    modelNameHint: modelNameHintInput || modelId,
+  };
 }
 
 async function promptApiKeyEndpointAndModel(ctx: ProviderAuthContext): Promise<FoundrySelection> {
@@ -711,6 +722,13 @@ async function loginWithTenantFallback(ctx: ProviderAuthContext): Promise<{
     return { account: getLoggedInAccount() };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    const isAzureTenantError =
+      /AADSTS/i.test(message) ||
+      /no subscriptions found/i.test(message) ||
+      /tenant/i.test(message);
+    if (!isAzureTenantError) {
+      throw error;
+    }
     const tenantId = await promptTenantId(ctx, {
       suggestions: extractTenantSuggestions(message),
       required: true,
@@ -872,7 +890,15 @@ const entraIdAuthMethod = {
           "Connection Test",
         );
       } else {
-        await ctx.prompter.note("Connection test successful!", "✓");
+        const statusNote = res.status === 400 ? " (400 Bad Request — endpoint reachable)" : "";
+        const statusBody = res.status === 400 ? await res.text().catch(() => "") : "";
+        await ctx.prompter.note(`Connection test successful!${statusNote}`, "✓");
+        if (statusBody) {
+          await ctx.prompter.note(
+            `Endpoint response: ${statusBody.slice(0, 200)}`,
+            "Connection Test",
+          );
+        }
       }
     } catch (err) {
       await ctx.prompter.note(
@@ -903,41 +929,6 @@ const entraIdAuthMethod = {
         "Token is refreshed automatically via az CLI — keep az login active.",
       ],
     });
-  },
-  onModelSelected: async (ctx: ProviderModelSelectedContext) => {
-    const providerConfig = ctx.config.models?.providers?.[PROVIDER_ID];
-    if (!providerConfig || !ctx.model.startsWith(`${PROVIDER_ID}/`)) {
-      return;
-    }
-    const selectedModelId = ctx.model.slice(`${PROVIDER_ID}/`.length);
-    const existingModel = providerConfig.models.find((model: { id: string }) => model.id === selectedModelId);
-    const selectedModelNameHint = resolveConfiguredModelNameHint(
-      selectedModelId,
-      existingModel?.name,
-    );
-    const selectedModelCompat = buildFoundryModelCompat(selectedModelId, selectedModelNameHint);
-    const providerEndpoint = normalizeFoundryEndpoint(providerConfig.baseUrl ?? "");
-    const nextProviderConfig: ModelProviderConfig = {
-      ...providerConfig,
-      baseUrl: buildFoundryProviderBaseUrl(providerEndpoint, selectedModelId, selectedModelNameHint),
-      api: resolveFoundryApi(selectedModelId, selectedModelNameHint),
-      models: [
-        {
-          ...(existingModel ?? {
-            id: selectedModelId,
-            name: selectedModelId,
-            reasoning: false,
-            input: ["text"],
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-            contextWindow: 128_000,
-            maxTokens: 16_384,
-          }),
-          ...(selectedModelCompat ? { compat: selectedModelCompat } : {}),
-        },
-      ],
-    };
-    applyFoundryProfileBinding(ctx.config, `${PROVIDER_ID}:entra`);
-    applyFoundryProviderConfig(ctx.config, nextProviderConfig);
   },
 };
 
@@ -1017,8 +1008,9 @@ function refreshEntraToken(params?: {
   tenantId?: string;
 }): { apiKey: string; expiresAt: number } {
   const result = getAccessTokenResult(params);
-  const expiresAt = result.expiresOn
-    ? new Date(result.expiresOn).getTime()
+  const rawExpiry = result.expiresOn ? new Date(result.expiresOn).getTime() : Number.NaN;
+  const expiresAt = Number.isFinite(rawExpiry)
+    ? rawExpiry
     : Date.now() + 55 * 60 * 1000; // default ~55 min
   cachedTokens.set(getFoundryTokenCacheKey(params), {
     token: result.accessToken,
@@ -1044,6 +1036,43 @@ export default definePluginEntry({
       auth: [entraIdAuthMethod, apiKeyAuthMethod],
       capabilities: {
         providerFamily: "openai",
+      },
+      onModelSelected: async (ctx: ProviderModelSelectedContext) => {
+        const providerConfig = ctx.config.models?.providers?.[PROVIDER_ID];
+        if (!providerConfig || !ctx.model.startsWith(`${PROVIDER_ID}/`)) {
+          return;
+        }
+        const selectedModelId = ctx.model.slice(`${PROVIDER_ID}/`.length);
+        const existingModel = providerConfig.models.find(
+          (model: { id: string }) => model.id === selectedModelId,
+        );
+        const selectedModelNameHint = resolveConfiguredModelNameHint(
+          selectedModelId,
+          existingModel?.name,
+        );
+        const selectedModelCompat = buildFoundryModelCompat(selectedModelId, selectedModelNameHint);
+        const providerEndpoint = normalizeFoundryEndpoint(providerConfig.baseUrl ?? "");
+        const nextProviderConfig: ModelProviderConfig = {
+          ...providerConfig,
+          baseUrl: buildFoundryProviderBaseUrl(providerEndpoint, selectedModelId, selectedModelNameHint),
+          api: resolveFoundryApi(selectedModelId, selectedModelNameHint),
+          models: [
+            {
+              ...(existingModel ?? {
+                id: selectedModelId,
+                name: selectedModelId,
+                reasoning: false,
+                input: ["text"],
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                contextWindow: 128_000,
+                maxTokens: 16_384,
+              }),
+              ...(selectedModelCompat ? { compat: selectedModelCompat } : {}),
+            },
+          ],
+        };
+        applyFoundryProfileBinding(ctx.config, `${PROVIDER_ID}:entra`);
+        applyFoundryProviderConfig(ctx.config, nextProviderConfig);
       },
       normalizeResolvedModel: ({ modelId, model }) => {
         const endpoint = extractFoundryEndpoint(model.baseUrl ?? "");
