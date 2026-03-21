@@ -1,7 +1,6 @@
 import {
   applyAuthProfileConfig,
   buildApiKeyCredential,
-  ensureAuthProfileStore,
   type ProviderAuthResult,
   type SecretInput,
 } from "openclaw/plugin-sdk/provider-auth";
@@ -69,6 +68,11 @@ export type CachedTokenEntry = {
 
 export type FoundryProviderApi = typeof DEFAULT_API | typeof DEFAULT_GPT5_API;
 
+export type FoundryDeploymentConfigInput = {
+  name: string;
+  modelName?: string;
+};
+
 type FoundryModelCompat = {
   maxTokensField: "max_completion_tokens" | "max_tokens";
 };
@@ -130,7 +134,10 @@ export function buildFoundryProviderBaseUrl(
     : buildAzureBaseUrl(endpoint, modelId);
 }
 
-export function extractFoundryEndpoint(baseUrl: string): string | undefined {
+export function extractFoundryEndpoint(baseUrl: string | null | undefined): string | undefined {
+  if (!baseUrl) {
+    return undefined;
+  }
   try {
     return new URL(baseUrl).origin;
   } catch {
@@ -169,44 +176,40 @@ export function buildFoundryProviderConfig(
   options?: {
     authMethod?: "api-key" | "entra-id";
     apiKey?: SecretInput;
+    deployments?: FoundryDeploymentConfigInput[];
   },
 ): ModelProviderConfig {
-  const compat = buildFoundryModelCompat(modelId, modelNameHint);
   const runtimeApiKey = options?.authMethod === "api-key" ? options.apiKey : undefined;
-  const isApiKeyAuth = typeof runtimeApiKey === "string";
+  const isApiKeyAuth = options?.authMethod === "api-key";
+  const deployments = options?.deployments?.length
+    ? options.deployments
+    : [{ name: modelId, modelName: modelNameHint ?? undefined }];
   return {
     baseUrl: buildFoundryProviderBaseUrl(endpoint, modelId, modelNameHint),
     api: resolveFoundryApi(modelId, modelNameHint),
-    ...(isApiKeyAuth ? { apiKey: runtimeApiKey } : {}),
-    ...(isApiKeyAuth ? { authHeader: false } : {}),
-    ...(isApiKeyAuth ? { headers: { "api-key": runtimeApiKey } } : {}),
-    models: [
-      {
-        id: modelId,
-        name:
-          typeof modelNameHint === "string" && modelNameHint.trim().length > 0
-            ? modelNameHint.trim()
-            : modelId,
+    ...(isApiKeyAuth
+      ? {
+          authHeader: false,
+          ...(runtimeApiKey !== undefined
+            ? { apiKey: runtimeApiKey, headers: { "api-key": runtimeApiKey } }
+            : {}),
+        }
+      : {}),
+    models: deployments.map((deployment) => {
+      const configuredName = resolveConfiguredModelNameHint(deployment.name, deployment.modelName);
+      const compat = buildFoundryModelCompat(deployment.name, configuredName);
+      return {
+        id: deployment.name,
+        name: configuredName ?? deployment.name,
         reasoning: false,
         input: ["text"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 128_000,
         maxTokens: 16_384,
         ...(compat ? { compat } : {}),
-      },
-    ],
+      };
+    }),
   };
-}
-
-export function normalizeEndpointOrigin(rawUrl: string | null | undefined): string | undefined {
-  if (!rawUrl) {
-    return undefined;
-  }
-  try {
-    return new URL(rawUrl).origin;
-  } catch {
-    return undefined;
-  }
 }
 
 function buildFoundryCredentialMetadata(params: {
@@ -239,6 +242,48 @@ function buildFoundryCredentialMetadata(params: {
   return metadata;
 }
 
+/**
+ * Build the plugins.allow patch so the provider is allowlisted when the
+ * config already gates plugins via a non-empty allow array.  Returns an
+ * empty object when no patch is needed (allowlist absent / already listed).
+ */
+function buildPluginsAllowPatch(
+  currentAllow: string[] | undefined,
+): { plugins: { allow: string[] } } | Record<string, never> {
+  if (!Array.isArray(currentAllow) || currentAllow.length === 0) {
+    return {};
+  }
+  if (currentAllow.includes(PROVIDER_ID)) {
+    return {};
+  }
+  return { plugins: { allow: [...currentAllow, PROVIDER_ID] } };
+}
+
+function buildFoundryAuthOrderPatch(params: {
+  profileId: string;
+  currentProviderProfileIds?: string[];
+}): { auth: { order: Record<string, string[]> } } {
+  const nextOrder = [
+    params.profileId,
+    ...(params.currentProviderProfileIds ?? []).filter(
+      (profileId) => profileId !== params.profileId,
+    ),
+  ];
+  return {
+    auth: {
+      order: {
+        [PROVIDER_ID]: nextOrder,
+      },
+    },
+  };
+}
+
+export function listConfiguredFoundryProfileIds(config: FoundryConfigShape): string[] {
+  return Object.entries(config.auth?.profiles ?? {})
+    .filter(([, profile]) => profile.provider === PROVIDER_ID)
+    .map(([profileId]) => profileId);
+}
+
 export function buildFoundryAuthResult(params: {
   profileId: string;
   apiKey: SecretInput;
@@ -251,6 +296,10 @@ export function buildFoundryAuthResult(params: {
   subscriptionName?: string;
   tenantId?: string;
   notes?: string[];
+  /** Current plugins.allow so the provider can self-allowlist during onboard. */
+  currentPluginsAllow?: string[];
+  currentProviderProfileIds?: string[];
+  deployments?: FoundryDeploymentConfigInput[];
 }): ProviderAuthResult {
   return {
     profiles: [
@@ -273,6 +322,10 @@ export function buildFoundryAuthResult(params: {
       },
     ],
     configPatch: {
+      ...buildFoundryAuthOrderPatch({
+        profileId: params.profileId,
+        currentProviderProfileIds: params.currentProviderProfileIds,
+      }),
       models: {
         providers: {
           [PROVIDER_ID]: buildFoundryProviderConfig(
@@ -282,25 +335,25 @@ export function buildFoundryAuthResult(params: {
             {
               authMethod: params.authMethod,
               apiKey: params.apiKey,
+              deployments: params.deployments,
             },
           ),
         },
       },
+      ...buildPluginsAllowPatch(params.currentPluginsAllow),
     },
     defaultModel: `${PROVIDER_ID}/${params.modelId}`,
     notes: params.notes,
   };
 }
 
-export function applyFoundryProfileBinding(
-  config: FoundryConfigShape,
-  profileId: string,
-): void {
-  applyAuthProfileConfig(config, {
+export function applyFoundryProfileBinding(config: FoundryConfigShape, profileId: string): void {
+  const next = applyAuthProfileConfig(config, {
     profileId,
     provider: PROVIDER_ID,
     mode: "api_key",
   });
+  config.auth = next.auth;
 }
 
 export function applyFoundryProviderConfig(
@@ -312,10 +365,7 @@ export function applyFoundryProviderConfig(
   config.models.providers[PROVIDER_ID] = providerConfig;
 }
 
-export function resolveFoundryTargetProfileId(
-  config: FoundryConfigShape,
-  agentDir?: string,
-): string | undefined {
+export function resolveFoundryTargetProfileId(config: FoundryConfigShape): string | undefined {
   const configuredProfiles = config.auth?.profiles ?? {};
   const configuredProfileEntries = Object.entries(configuredProfiles).filter(([, profile]) => {
     return profile.provider === PROVIDER_ID;
@@ -323,19 +373,9 @@ export function resolveFoundryTargetProfileId(
   if (configuredProfileEntries.length === 0) {
     return undefined;
   }
-  const configuredProfileId =
+  // Prefer the explicitly ordered profile; fall back to the sole entry when there is exactly one.
+  return (
     config.auth?.order?.[PROVIDER_ID]?.find((profileId) => profileId.trim().length > 0) ??
-    (configuredProfileEntries.length === 1 ? configuredProfileEntries[0]?.[0] : undefined);
-  if (!configuredProfileId || !agentDir) {
-    return configuredProfileId;
-  }
-  const authStore = ensureAuthProfileStore(agentDir, {
-    allowKeychainPrompt: false,
-  });
-  const credential = authStore.profiles[configuredProfileId];
-  const authMethod = credential?.type === "api_key" ? credential.metadata?.authMethod : undefined;
-  if (authMethod === "api-key" || authMethod === "entra-id") {
-    return configuredProfileId;
-  }
-  return configuredProfileId;
+    (configuredProfileEntries.length === 1 ? configuredProfileEntries[0]?.[0] : undefined)
+  );
 }

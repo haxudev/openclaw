@@ -23,11 +23,7 @@
       "choiceHint": "Use an Azure OpenAI API key directly",
       "groupId": "microsoft-foundry",
       "groupLabel": "Microsoft Foundry",
-      "groupHint": "Entra ID + API key",
-      "optionKey": "azureOpenaiApiKey",
-      "cliFlag": "--azure-openai-api-key",
-      "cliOption": "--azure-openai-api-key <key>",
-      "cliDescription": "Azure OpenAI API key"
+      "groupHint": "Entra ID + API key"
     }
   ],
   "configSchema": {

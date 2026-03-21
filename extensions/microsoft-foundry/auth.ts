@@ -13,12 +13,8 @@ import {
 } from "openclaw/plugin-sdk/provider-auth";
 import { getLoggedInAccount, isAzCliInstalled } from "./cli.js";
 import {
-  buildFoundryAuthResult,
-  PROVIDER_ID,
-  resolveConfiguredModelNameHint,
-} from "./shared.js";
-import {
   loginWithTenantFallback,
+  listResourceDeployments,
   promptApiKeyEndpointAndModel,
   promptEndpointAndModelManually,
   promptTenantId,
@@ -27,6 +23,12 @@ import {
   listSubscriptions,
   testFoundryConnection,
 } from "./onboard.js";
+import {
+  buildFoundryAuthResult,
+  listConfiguredFoundryProfileIds,
+  PROVIDER_ID,
+  resolveConfiguredModelNameHint,
+} from "./shared.js";
 
 export const entraIdAuthMethod: ProviderAuthMethod = {
   id: "entra-id",
@@ -75,7 +77,8 @@ export const entraIdAuthMethod: ProviderAuthMethod = {
     if (subs.length === 0) {
       tenantId ??= await promptTenantId(ctx, {
         required: true,
-        reason: "No enabled Azure subscriptions were found. Continue with tenant-scoped Entra ID auth instead.",
+        reason:
+          "No enabled Azure subscriptions were found. Continue with tenant-scoped Entra ID auth instead.",
       });
       await ctx.prompter.note(`Continuing with tenant-scoped auth (${tenantId}).`, "Azure Tenant");
     } else if (subs.length === 1) {
@@ -100,6 +103,12 @@ export const entraIdAuthMethod: ProviderAuthMethod = {
     let endpoint: string;
     let modelId: string;
     let modelNameHint: string | undefined;
+    let discoveredDeployments:
+      | Array<{
+          name: string;
+          modelName?: string;
+        }>
+      | undefined;
     if (selectedSub) {
       const useDiscoveredResource = await ctx.prompter.confirm({
         message: "Discover Microsoft Foundry resources from this subscription?",
@@ -107,7 +116,17 @@ export const entraIdAuthMethod: ProviderAuthMethod = {
       });
       if (useDiscoveredResource) {
         const selectedResource = await selectFoundryResource(ctx, selectedSub);
-        const selectedDeployment = await selectFoundryDeployment(ctx, selectedResource, selectedSub.id);
+        const selectedDeployment = await selectFoundryDeployment(
+          ctx,
+          selectedResource,
+          selectedSub.id,
+        );
+        discoveredDeployments = listResourceDeployments(selectedResource, selectedSub.id).map(
+          (deployment) => ({
+            name: deployment.name,
+            ...(deployment.modelName ? { modelName: deployment.modelName } : {}),
+          }),
+        );
         endpoint = selectedResource.endpoint;
         modelId = selectedDeployment.name;
         modelNameHint = resolveConfiguredModelNameHint(modelId, selectedDeployment.modelName);
@@ -148,6 +167,9 @@ export const entraIdAuthMethod: ProviderAuthMethod = {
       ...(selectedSub?.id ? { subscriptionId: selectedSub.id } : {}),
       ...(selectedSub?.name ? { subscriptionName: selectedSub.name } : {}),
       ...(tenantId ? { tenantId } : {}),
+      currentProviderProfileIds: listConfiguredFoundryProfileIds(ctx.config),
+      currentPluginsAllow: ctx.config.plugins?.allow,
+      ...(discoveredDeployments ? { deployments: discoveredDeployments } : {}),
       notes: [
         ...(selectedSub?.name ? [`Subscription: ${selectedSub.name}`] : []),
         ...(tenantId ? [`Tenant: ${tenantId}`] : []),
@@ -184,7 +206,9 @@ export const apiKeyAuthMethod: ProviderAuthMethod = {
       token: normalizeOptionalSecretInput(ctx.opts?.azureOpenaiApiKey),
       tokenProvider: PROVIDER_ID,
       secretInputMode:
-        ctx.allowSecretRefPrompt === false ? (ctx.secretInputMode ?? "plaintext") : ctx.secretInputMode,
+        ctx.allowSecretRefPrompt === false
+          ? (ctx.secretInputMode ?? "plaintext")
+          : ctx.secretInputMode,
       config: ctx.config,
       expectedProviders: [PROVIDER_ID],
       provider: PROVIDER_ID,
@@ -212,6 +236,8 @@ export const apiKeyAuthMethod: ProviderAuthMethod = {
       modelNameHint:
         selection.modelNameHint ?? existingMetadata?.modelName ?? existingMetadata?.modelId,
       authMethod: "api-key",
+      currentProviderProfileIds: listConfiguredFoundryProfileIds(ctx.config),
+      currentPluginsAllow: ctx.config.plugins?.allow,
       notes: [`Endpoint: ${selection.endpoint}`, `Model: ${selection.modelId}`],
     });
   },

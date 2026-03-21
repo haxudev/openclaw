@@ -19,7 +19,7 @@ export function buildMicrosoftFoundryProvider(): ProviderPlugin {
   return {
     id: PROVIDER_ID,
     label: "Microsoft Foundry",
-    docsPath: "/providers/azure",
+    docsPath: "/providers/models",
     envVars: ["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"],
     auth: [entraIdAuthMethod, apiKeyAuthMethod],
     capabilities: {
@@ -31,8 +31,13 @@ export function buildMicrosoftFoundryProvider(): ProviderPlugin {
         return;
       }
       const selectedModelId = ctx.model.slice(`${PROVIDER_ID}/`.length);
-      const existingModel = providerConfig.models.find((model: { id: string }) => model.id === selectedModelId);
-      const selectedModelNameHint = resolveConfiguredModelNameHint(selectedModelId, existingModel?.name);
+      const existingModel = providerConfig.models.find(
+        (model: { id: string }) => model.id === selectedModelId,
+      );
+      const selectedModelNameHint = resolveConfiguredModelNameHint(
+        selectedModelId,
+        existingModel?.name,
+      );
       const selectedModelCompat = buildFoundryModelCompat(selectedModelId, selectedModelNameHint);
       const providerEndpoint = normalizeFoundryEndpoint(providerConfig.baseUrl ?? "");
       const nextModels = providerConfig.models.map((model) =>
@@ -57,11 +62,15 @@ export function buildMicrosoftFoundryProvider(): ProviderPlugin {
       }
       const nextProviderConfig: ModelProviderConfig = {
         ...providerConfig,
-        baseUrl: buildFoundryProviderBaseUrl(providerEndpoint, selectedModelId, selectedModelNameHint),
+        baseUrl: buildFoundryProviderBaseUrl(
+          providerEndpoint,
+          selectedModelId,
+          selectedModelNameHint,
+        ),
         api: resolveFoundryApi(selectedModelId, selectedModelNameHint),
         models: nextModels,
       };
-      const targetProfileId = resolveFoundryTargetProfileId(ctx.config, ctx.agentDir);
+      const targetProfileId = resolveFoundryTargetProfileId(ctx.config);
       if (targetProfileId) {
         applyFoundryProfileBinding(ctx.config, targetProfileId);
       }

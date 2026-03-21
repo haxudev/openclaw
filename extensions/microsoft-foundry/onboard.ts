@@ -14,7 +14,7 @@ import {
   type FoundryResourceOption,
   type FoundrySelection,
   buildFoundryProviderBaseUrl,
-  normalizeEndpointOrigin,
+  extractFoundryEndpoint,
   resolveConfiguredModelNameHint,
   resolveFoundryApi,
   DEFAULT_GPT5_API,
@@ -42,7 +42,7 @@ export function listFoundryResources(subscriptionId?: string): FoundryResourceOp
         continue;
       }
       if (account.kind === "OpenAI") {
-        const endpoint = normalizeEndpointOrigin(account.endpoint);
+        const endpoint = extractFoundryEndpoint(account.endpoint);
         if (!endpoint) {
           continue;
         }
@@ -177,19 +177,28 @@ export async function selectFoundryDeployment(
     options: deployments.map((deployment) => ({
       value: deployment.name,
       label: deployment.name,
-      hint: [deployment.modelName, deployment.modelVersion, deployment.sku].filter(Boolean).join(" | "),
+      hint: [deployment.modelName, deployment.modelVersion, deployment.sku]
+        .filter(Boolean)
+        .join(" | "),
     })),
   });
-  return deployments.find((deployment) => deployment.name === selectedDeploymentName) ?? deployments[0]!;
+  return (
+    deployments.find((deployment) => deployment.name === selectedDeploymentName) ?? deployments[0]!
+  );
 }
 
-export async function promptEndpointAndModelManually(
+async function promptEndpointAndModelBase(
   ctx: ProviderAuthContext,
+  options?: {
+    endpointInitialValue?: string;
+    modelInitialValue?: string;
+  },
 ): Promise<FoundrySelection> {
   const endpoint = String(
     await ctx.prompter.text({
       message: "Microsoft Foundry endpoint URL",
       placeholder: "https://xxx.openai.azure.com or https://xxx.services.ai.azure.com",
+      ...(options?.endpointInitialValue ? { initialValue: options.endpointInitialValue } : {}),
       validate: (v) => {
         const val = String(v ?? "").trim();
         if (!val) return "Endpoint URL is required";
@@ -205,6 +214,7 @@ export async function promptEndpointAndModelManually(
   const modelId = String(
     await ctx.prompter.text({
       message: "Default model/deployment name",
+      ...(options?.modelInitialValue ? { initialValue: options.modelInitialValue } : {}),
       placeholder: "gpt-4o",
       validate: (v) => {
         const val = String(v ?? "").trim();
@@ -227,47 +237,19 @@ export async function promptEndpointAndModelManually(
   };
 }
 
-export async function promptApiKeyEndpointAndModel(ctx: ProviderAuthContext): Promise<FoundrySelection> {
-  const endpoint = String(
-    await ctx.prompter.text({
-      message: "Microsoft Foundry endpoint URL",
-      placeholder: "https://xxx.openai.azure.com or https://xxx.services.ai.azure.com",
-      initialValue: process.env.AZURE_OPENAI_ENDPOINT,
-      validate: (v) => {
-        const val = String(v ?? "").trim();
-        if (!val) return "Endpoint URL is required";
-        try {
-          new URL(val);
-        } catch {
-          return "Invalid URL";
-        }
-        return undefined;
-      },
-    }),
-  ).trim();
-  const modelId = String(
-    await ctx.prompter.text({
-      message: "Default model/deployment name",
-      initialValue: "gpt-4o",
-      validate: (v) => {
-        const val = String(v ?? "").trim();
-        if (!val) return "Model ID is required";
-        return undefined;
-      },
-    }),
-  ).trim();
-  const modelNameHintInput = String(
-    await ctx.prompter.text({
-      message: "Underlying Azure model family (optional)",
-      initialValue: modelId,
-      placeholder: "gpt-5.4, gpt-4o, etc.",
-    }),
-  ).trim();
-  return {
-    endpoint,
-    modelId,
-    modelNameHint: modelNameHintInput || modelId,
-  };
+export async function promptEndpointAndModelManually(
+  ctx: ProviderAuthContext,
+): Promise<FoundrySelection> {
+  return promptEndpointAndModelBase(ctx);
+}
+
+export async function promptApiKeyEndpointAndModel(
+  ctx: ProviderAuthContext,
+): Promise<FoundrySelection> {
+  return promptEndpointAndModelBase(ctx, {
+    endpointInitialValue: process.env.AZURE_OPENAI_ENDPOINT,
+    modelInitialValue: "gpt-4o",
+  });
 }
 
 export function buildFoundryConnectionTest(params: {
@@ -275,10 +257,14 @@ export function buildFoundryConnectionTest(params: {
   modelId: string;
   modelNameHint?: string | null;
 }): { url: string; body: Record<string, unknown> } {
-  const baseUrl = buildFoundryProviderBaseUrl(params.endpoint, params.modelId, params.modelNameHint);
+  const baseUrl = buildFoundryProviderBaseUrl(
+    params.endpoint,
+    params.modelId,
+    params.modelNameHint,
+  );
   if (resolveFoundryApi(params.modelId, params.modelNameHint) === DEFAULT_GPT5_API) {
     return {
-      url: `${baseUrl}/responses?api-version=2025-04-01-preview`,
+      url: `${baseUrl}/responses`,
       body: {
         model: params.modelId,
         input: "hi",
@@ -287,7 +273,7 @@ export function buildFoundryConnectionTest(params: {
     };
   }
   return {
-    url: `${baseUrl}/chat/completions?api-version=2024-12-01-preview`,
+    url: `${baseUrl}/chat/completions`,
     body: {
       messages: [{ role: "user", content: "hi" }],
       max_tokens: 1,
@@ -295,7 +281,9 @@ export function buildFoundryConnectionTest(params: {
   };
 }
 
-export function extractTenantSuggestions(rawMessage: string): Array<{ id: string; label?: string }> {
+export function extractTenantSuggestions(
+  rawMessage: string,
+): Array<{ id: string; label?: string }> {
   const suggestions: Array<{ id: string; label?: string }> = [];
   const seen = new Set<string>();
   const regex = /([0-9a-fA-F-]{36})(?:\s+'([^'\r\n]+)')?/g;
@@ -318,9 +306,8 @@ export function isValidTenantIdentifier(value: string): boolean {
   if (!trimmed) {
     return false;
   }
-  const isTenantUuid = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(
-    trimmed,
-  );
+  const isTenantUuid =
+    /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(trimmed);
   const isTenantDomain =
     /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$/.test(
       trimmed,
@@ -361,7 +348,9 @@ export async function promptTenantId(
         if (!trimmed) {
           return params?.required ? "Tenant ID is required" : undefined;
         }
-        return isValidTenantIdentifier(trimmed) ? undefined : "Enter a valid tenant ID or tenant domain";
+        return isValidTenantIdentifier(trimmed)
+          ? undefined
+          : "Enter a valid tenant ID or tenant domain";
       },
     }),
   ).trim();

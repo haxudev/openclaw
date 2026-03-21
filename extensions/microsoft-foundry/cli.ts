@@ -23,11 +23,7 @@ export async function execAzAsync(args: string[]): Promise<string> {
       (error, stdout, stderr) => {
         if (error) {
           const details = `${String(stderr ?? "").trim()} ${String(stdout ?? "").trim()}`.trim();
-          reject(
-            new Error(
-              details ? `${error.message}: ${details}` : error.message,
-            ),
-          );
+          reject(new Error(details ? `${error.message}: ${details}` : error.message));
           return;
         }
         resolve(String(stdout).trim());
@@ -55,17 +51,21 @@ export function getLoggedInAccount(): AzAccount | null {
 
 export function listSubscriptions(): AzAccount[] {
   try {
-    const subs = JSON.parse(execAz(["account", "list", "--output", "json", "--all"])) as AzAccount[];
+    const subs = JSON.parse(
+      execAz(["account", "list", "--output", "json", "--all"]),
+    ) as AzAccount[];
     return subs.filter((sub) => sub.state === "Enabled");
   } catch {
     return [];
   }
 }
 
-export function getAccessTokenResult(params?: {
+type AccessTokenParams = {
   subscriptionId?: string;
   tenantId?: string;
-}): AzAccessToken {
+};
+
+function buildAccessTokenArgs(params?: AccessTokenParams): string[] {
   const args = [
     "account",
     "get-access-token",
@@ -79,27 +79,17 @@ export function getAccessTokenResult(params?: {
   } else if (params?.tenantId) {
     args.push("--tenant", params.tenantId);
   }
-  return JSON.parse(execAz(args)) as AzAccessToken;
+  return args;
 }
 
-export async function getAccessTokenResultAsync(params?: {
-  subscriptionId?: string;
-  tenantId?: string;
-}): Promise<AzAccessToken> {
-  const args = [
-    "account",
-    "get-access-token",
-    "--resource",
-    COGNITIVE_SERVICES_RESOURCE,
-    "--output",
-    "json",
-  ];
-  if (params?.subscriptionId) {
-    args.push("--subscription", params.subscriptionId);
-  } else if (params?.tenantId) {
-    args.push("--tenant", params.tenantId);
-  }
-  return JSON.parse(await execAzAsync(args)) as AzAccessToken;
+export function getAccessTokenResult(params?: AccessTokenParams): AzAccessToken {
+  return JSON.parse(execAz(buildAccessTokenArgs(params))) as AzAccessToken;
+}
+
+export async function getAccessTokenResultAsync(
+  params?: AccessTokenParams,
+): Promise<AzAccessToken> {
+  return JSON.parse(await execAzAsync(buildAccessTokenArgs(params))) as AzAccessToken;
 }
 
 export async function azLoginDeviceCode(): Promise<void> {
@@ -124,25 +114,28 @@ export async function azLoginDeviceCodeWithOptions(params: {
     });
     const stdoutChunks: string[] = [];
     const stderrChunks: string[] = [];
-    const appendBoundedChunk = (chunks: string[], text: string): void => {
+    let stdoutLen = 0;
+    let stderrLen = 0;
+    const appendBoundedChunk = (chunks: string[], text: string, len: number): number => {
       if (!text) {
-        return;
+        return len;
       }
       chunks.push(text);
-      let totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-      while (totalLength > maxCapturedLoginOutputChars && chunks.length > 0) {
+      let total = len + text.length;
+      while (total > maxCapturedLoginOutputChars && chunks.length > 0) {
         const removed = chunks.shift();
-        totalLength -= removed?.length ?? 0;
+        total -= removed?.length ?? 0;
       }
+      return total;
     };
     child.stdout?.on("data", (chunk) => {
       const text = String(chunk);
-      appendBoundedChunk(stdoutChunks, text);
+      stdoutLen = appendBoundedChunk(stdoutChunks, text, stdoutLen);
       process.stdout.write(text);
     });
     child.stderr?.on("data", (chunk) => {
       const text = String(chunk);
-      appendBoundedChunk(stderrChunks, text);
+      stderrLen = appendBoundedChunk(stderrChunks, text, stderrLen);
       process.stderr.write(text);
     });
     child.on("close", (code) => {
@@ -153,7 +146,9 @@ export async function azLoginDeviceCodeWithOptions(params: {
       const output = [...stderrChunks, ...stdoutChunks].join("").trim();
       reject(
         new Error(
-          output ? `az login exited with code ${code}: ${output}` : `az login exited with code ${code}`,
+          output
+            ? `az login exited with code ${code}: ${output}`
+            : `az login exited with code ${code}`,
         ),
       );
     });

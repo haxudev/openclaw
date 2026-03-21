@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { OpenClawConfig } from "../../src/config/types.openclaw.js";
 import { createTestPluginApi } from "../../test/helpers/extensions/plugin-api.js";
 import plugin from "./index.js";
-import type { OpenClawConfig } from "../../src/config/types.openclaw.js";
 import { isValidTenantIdentifier } from "./onboard.js";
 import { buildFoundryAuthResult } from "./shared.js";
 
@@ -165,14 +165,14 @@ describe("microsoft-foundry plugin", () => {
         _options: unknown,
         callback: (error: Error | null, stdout: string, stderr: string) => void,
       ) => {
-      callback(
-        null,
-        JSON.stringify({
-          accessToken: "test-token",
-          expiresOn: new Date(Date.now() + 60_000).toISOString(),
-        }),
-        "",
-      );
+        callback(
+          null,
+          JSON.stringify({
+            accessToken: "test-token",
+            expiresOn: new Date(Date.now() + 60_000).toISOString(),
+          }),
+          "",
+        );
       },
     );
     ensureAuthProfileStoreMock.mockReturnValueOnce({
@@ -336,10 +336,9 @@ describe("microsoft-foundry plugin", () => {
       agentDir: "/tmp/test-agent",
     });
 
-    expect(config.models?.providers?.["microsoft-foundry"]?.models.map((model) => model.id)).toEqual([
-      "alias-one",
-      "alias-two",
-    ]);
+    expect(
+      config.models?.providers?.["microsoft-foundry"]?.models.map((model) => model.id),
+    ).toEqual(["alias-one", "alias-two"]);
   });
 
   it("accepts tenant domains as valid tenant identifiers", () => {
@@ -362,5 +361,64 @@ describe("microsoft-foundry plugin", () => {
       authHeader: false,
       headers: { "api-key": "test-api-key" },
     });
+  });
+
+  it("keeps Azure API key header overrides when API-key auth uses a secret ref", () => {
+    const secretRef = {
+      source: "env" as const,
+      provider: "default",
+      id: "AZURE_OPENAI_API_KEY",
+    };
+    const result = buildFoundryAuthResult({
+      profileId: "microsoft-foundry:default",
+      apiKey: secretRef,
+      endpoint: "https://example.services.ai.azure.com",
+      modelId: "gpt-4o",
+      authMethod: "api-key",
+    });
+
+    expect(result.configPatch?.models?.providers?.["microsoft-foundry"]).toMatchObject({
+      apiKey: secretRef,
+      authHeader: false,
+      headers: { "api-key": secretRef },
+    });
+  });
+
+  it("moves the selected Foundry auth profile to the front of auth.order", () => {
+    const result = buildFoundryAuthResult({
+      profileId: "microsoft-foundry:entra",
+      apiKey: "__entra_id_dynamic__",
+      endpoint: "https://example.services.ai.azure.com",
+      modelId: "gpt-5.4",
+      authMethod: "entra-id",
+      currentProviderProfileIds: ["microsoft-foundry:default", "microsoft-foundry:entra"],
+    });
+
+    expect(result.configPatch?.auth?.order?.["microsoft-foundry"]).toEqual([
+      "microsoft-foundry:entra",
+      "microsoft-foundry:default",
+    ]);
+  });
+
+  it("persists discovered deployments alongside the selected default model", () => {
+    const result = buildFoundryAuthResult({
+      profileId: "microsoft-foundry:entra",
+      apiKey: "__entra_id_dynamic__",
+      endpoint: "https://example.services.ai.azure.com",
+      modelId: "deployment-gpt5",
+      modelNameHint: "gpt-5.4",
+      authMethod: "entra-id",
+      deployments: [
+        { name: "deployment-gpt5", modelName: "gpt-5.4" },
+        { name: "deployment-gpt4o", modelName: "gpt-4o" },
+      ],
+    });
+
+    const provider = result.configPatch?.models?.providers?.["microsoft-foundry"];
+    expect(provider?.models.map((model) => model.id)).toEqual([
+      "deployment-gpt5",
+      "deployment-gpt4o",
+    ]);
+    expect(result.defaultModel).toBe("microsoft-foundry/deployment-gpt5");
   });
 });

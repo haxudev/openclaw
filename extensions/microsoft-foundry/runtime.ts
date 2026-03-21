@@ -1,5 +1,5 @@
-import { ensureAuthProfileStore } from "openclaw/plugin-sdk/provider-auth";
 import type { ProviderPrepareRuntimeAuthContext } from "openclaw/plugin-sdk/core";
+import { ensureAuthProfileStore } from "openclaw/plugin-sdk/provider-auth";
 import { getAccessTokenResultAsync } from "./cli.js";
 import {
   type CachedTokenEntry,
@@ -44,12 +44,17 @@ export async function prepareFoundryRuntimeAuth(ctx: ProviderPrepareRuntimeAuthC
           ? metadata.modelId.trim()
           : ctx.modelId;
     const activeModelNameHint = ctx.modelId === metadata?.modelId ? metadata?.modelName : undefined;
-    const modelNameHint = resolveConfiguredModelNameHint(modelId, ctx.model.name ?? activeModelNameHint);
+    const modelNameHint = resolveConfiguredModelNameHint(
+      modelId,
+      ctx.model.name ?? activeModelNameHint,
+    );
     const endpoint =
       typeof metadata?.endpoint === "string" && metadata.endpoint.trim().length > 0
         ? metadata.endpoint.trim()
         : extractFoundryEndpoint(ctx.model.baseUrl ?? "");
-    const baseUrl = endpoint ? buildFoundryProviderBaseUrl(endpoint, modelId, modelNameHint) : undefined;
+    const baseUrl = endpoint
+      ? buildFoundryProviderBaseUrl(endpoint, modelId, modelNameHint)
+      : undefined;
     const cacheKey = getFoundryTokenCacheKey({
       subscriptionId: metadata?.subscriptionId,
       tenantId: metadata?.tenantId,
