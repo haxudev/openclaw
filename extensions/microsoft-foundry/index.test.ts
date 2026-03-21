@@ -3,6 +3,7 @@ import { createTestPluginApi } from "../../test/helpers/extensions/plugin-api.js
 import plugin from "./index.js";
 import type { OpenClawConfig } from "../../src/config/types.openclaw.js";
 import { isValidTenantIdentifier } from "./onboard.js";
+import { buildFoundryAuthResult } from "./shared.js";
 
 const execFileMock = vi.hoisted(() => vi.fn());
 const execFileSyncMock = vi.hoisted(() => vi.fn());
@@ -345,5 +346,21 @@ describe("microsoft-foundry plugin", () => {
     expect(isValidTenantIdentifier("contoso.onmicrosoft.com")).toBe(true);
     expect(isValidTenantIdentifier("00000000-0000-0000-0000-000000000000")).toBe(true);
     expect(isValidTenantIdentifier("not a tenant")).toBe(false);
+  });
+
+  it("writes Azure API key header overrides for API-key auth configs", () => {
+    const result = buildFoundryAuthResult({
+      profileId: "microsoft-foundry:default",
+      apiKey: "test-api-key",
+      endpoint: "https://example.services.ai.azure.com",
+      modelId: "gpt-4o",
+      authMethod: "api-key",
+    });
+
+    expect(result.configPatch?.models?.providers?.["microsoft-foundry"]).toMatchObject({
+      apiKey: "test-api-key",
+      authHeader: false,
+      headers: { "api-key": "test-api-key" },
+    });
   });
 });

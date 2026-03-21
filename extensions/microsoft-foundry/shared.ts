@@ -166,11 +166,20 @@ export function buildFoundryProviderConfig(
   endpoint: string,
   modelId: string,
   modelNameHint?: string | null,
+  options?: {
+    authMethod?: "api-key" | "entra-id";
+    apiKey?: SecretInput;
+  },
 ): ModelProviderConfig {
   const compat = buildFoundryModelCompat(modelId, modelNameHint);
+  const runtimeApiKey = options?.authMethod === "api-key" ? options.apiKey : undefined;
+  const isApiKeyAuth = typeof runtimeApiKey === "string";
   return {
     baseUrl: buildFoundryProviderBaseUrl(endpoint, modelId, modelNameHint),
     api: resolveFoundryApi(modelId, modelNameHint),
+    ...(isApiKeyAuth ? { apiKey: runtimeApiKey } : {}),
+    ...(isApiKeyAuth ? { authHeader: false } : {}),
+    ...(isApiKeyAuth ? { headers: { "api-key": runtimeApiKey } } : {}),
     models: [
       {
         id: modelId,
@@ -270,6 +279,10 @@ export function buildFoundryAuthResult(params: {
             params.endpoint,
             params.modelId,
             params.modelNameHint,
+            {
+              authMethod: params.authMethod,
+              apiKey: params.apiKey,
+            },
           ),
         },
       },
