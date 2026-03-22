@@ -33,12 +33,12 @@ import {
 export const entraIdAuthMethod: ProviderAuthMethod = {
   id: "entra-id",
   label: "Entra ID (az login)",
-  hint: "Use your Azure login - no API key needed",
+  hint: "Use your Azure login — no API key needed",
   kind: "custom",
   wizard: {
     choiceId: "microsoft-foundry-entra",
     choiceLabel: "Microsoft Foundry (Entra ID / az login)",
-    choiceHint: "Use your Azure login - no API key needed",
+    choiceHint: "Use your Azure login — no API key needed",
     groupId: "microsoft-foundry",
     groupLabel: "Microsoft Foundry",
     groupHint: "Entra ID + API key",
@@ -116,17 +116,16 @@ export const entraIdAuthMethod: ProviderAuthMethod = {
       });
       if (useDiscoveredResource) {
         const selectedResource = await selectFoundryResource(ctx, selectedSub);
+        const resourceDeployments = listResourceDeployments(selectedResource, selectedSub.id);
         const selectedDeployment = await selectFoundryDeployment(
           ctx,
           selectedResource,
-          selectedSub.id,
+          resourceDeployments,
         );
-        discoveredDeployments = listResourceDeployments(selectedResource, selectedSub.id).map(
-          (deployment) => ({
-            name: deployment.name,
-            ...(deployment.modelName ? { modelName: deployment.modelName } : {}),
-          }),
-        );
+        discoveredDeployments = resourceDeployments.map((deployment) => ({
+          name: deployment.name,
+          ...(deployment.modelName ? { modelName: deployment.modelName } : {}),
+        }));
         endpoint = selectedResource.endpoint;
         modelId = selectedDeployment.name;
         modelNameHint = resolveConfiguredModelNameHint(modelId, selectedDeployment.modelName);

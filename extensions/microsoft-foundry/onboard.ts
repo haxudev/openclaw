@@ -156,9 +156,8 @@ export async function selectFoundryResource(
 export async function selectFoundryDeployment(
   ctx: ProviderAuthContext,
   resource: FoundryResourceOption,
-  subscriptionId?: string,
+  deployments: AzDeploymentSummary[],
 ): Promise<AzDeploymentSummary> {
-  const deployments = listResourceDeployments(resource, subscriptionId);
   if (deployments.length === 0) {
     throw new Error(
       [

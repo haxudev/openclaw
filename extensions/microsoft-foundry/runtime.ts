@@ -13,6 +13,11 @@ import {
 const cachedTokens = new Map<string, CachedTokenEntry>();
 const refreshPromises = new Map<string, Promise<{ apiKey: string; expiresAt: number }>>();
 
+export function resetFoundryRuntimeAuthCaches(): void {
+  cachedTokens.clear();
+  refreshPromises.clear();
+}
+
 async function refreshEntraToken(params?: {
   subscriptionId?: string;
   tenantId?: string;

@@ -3,6 +3,7 @@ import type { OpenClawConfig } from "../../src/config/types.openclaw.js";
 import { createTestPluginApi } from "../../test/helpers/extensions/plugin-api.js";
 import plugin from "./index.js";
 import { buildFoundryConnectionTest, isValidTenantIdentifier } from "./onboard.js";
+import { resetFoundryRuntimeAuthCaches } from "./runtime.js";
 import { buildFoundryAuthResult } from "./shared.js";
 
 const execFileMock = vi.hoisted(() => vi.fn());
@@ -50,6 +51,7 @@ function registerProvider() {
 
 describe("microsoft-foundry plugin", () => {
   beforeEach(() => {
+    resetFoundryRuntimeAuthCaches();
     execFileMock.mockReset();
     execFileSyncMock.mockReset();
     ensureAuthProfileStoreMock.mockReset();
