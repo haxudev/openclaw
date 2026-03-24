@@ -7,6 +7,7 @@ import {
   buildFoundryProviderBaseUrl,
   extractFoundryEndpoint,
   getFoundryTokenCacheKey,
+  isFoundryProviderApi,
   resolveConfiguredModelNameHint,
 } from "./shared-runtime.js";
 
@@ -53,12 +54,18 @@ export async function prepareFoundryRuntimeAuth(ctx: ProviderPrepareRuntimeAuthC
       modelId,
       ctx.model.name ?? activeModelNameHint,
     );
+    const configuredApi =
+      typeof metadata?.api === "string" && isFoundryProviderApi(metadata.api)
+        ? metadata.api
+        : isFoundryProviderApi(ctx.model.api)
+          ? ctx.model.api
+          : undefined;
     const endpoint =
       typeof metadata?.endpoint === "string" && metadata.endpoint.trim().length > 0
         ? metadata.endpoint.trim()
         : extractFoundryEndpoint(ctx.model.baseUrl ?? "");
     const baseUrl = endpoint
-      ? buildFoundryProviderBaseUrl(endpoint, modelId, modelNameHint)
+      ? buildFoundryProviderBaseUrl(endpoint, modelId, modelNameHint, configuredApi)
       : undefined;
     const cacheKey = getFoundryTokenCacheKey({
       subscriptionId: metadata?.subscriptionId,
@@ -88,8 +95,7 @@ export async function prepareFoundryRuntimeAuth(ctx: ProviderPrepareRuntimeAuthC
       ...(baseUrl ? { baseUrl } : {}),
     };
   } catch (err) {
-    throw new Error(
-      `Failed to refresh Azure Entra ID token via az CLI: ${String(err)}\nMake sure you are logged in: az login --use-device-code`,
-    );
+    const details = err instanceof Error ? err.message : String(err);
+    throw new Error(`Failed to refresh Azure Entra ID token via az CLI: ${details}`);
   }
 }

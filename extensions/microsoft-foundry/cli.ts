@@ -2,6 +2,41 @@ import { execFile, execFileSync, spawn } from "node:child_process";
 import type { AzAccessToken, AzAccount } from "./shared.js";
 import { COGNITIVE_SERVICES_RESOURCE } from "./shared.js";
 
+function summarizeAzErrorMessage(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return "";
+  }
+  const normalized = trimmed.replace(/\s+/g, " ");
+  if (/not recognized|enoent|spawn .* az/i.test(normalized)) {
+    return "Azure CLI (az) is not installed or not on PATH.";
+  }
+  if (/az login/i.test(normalized) || /please run 'az login'/i.test(normalized)) {
+    return "Azure CLI is not logged in. Run `az login --use-device-code`.";
+  }
+  if (
+    /subscription/i.test(normalized) &&
+    /could not be found|does not exist|no subscriptions/i.test(normalized)
+  ) {
+    return "Azure CLI could not find an accessible subscription. Check the selected subscription or tenant access.";
+  }
+  if (
+    /tenant/i.test(normalized) &&
+    /not found|invalid|doesn't exist|does not exist/i.test(normalized)
+  ) {
+    return "Azure CLI could not use that tenant. Verify the tenant ID or tenant domain and try `az login --tenant <tenant>`.";
+  }
+  if (/aadsts\d+/i.test(normalized)) {
+    return "Azure login failed for the selected tenant. Re-run `az login --use-device-code` and confirm the tenant is correct.";
+  }
+  return normalized.slice(0, 300);
+}
+
+function buildAzCommandError(error: Error, stderr: string, stdout: string): Error {
+  const details = summarizeAzErrorMessage(`${String(stderr ?? "")} ${String(stdout ?? "")}`);
+  return new Error(details ? `${error.message}: ${details}` : error.message);
+}
+
 export function execAz(args: string[]): string {
   return execFileSync("az", args, {
     encoding: "utf-8",
@@ -22,8 +57,7 @@ export async function execAzAsync(args: string[]): Promise<string> {
       },
       (error, stdout, stderr) => {
         if (error) {
-          const details = `${String(stderr ?? "").trim()} ${String(stdout ?? "").trim()}`.trim();
-          reject(new Error(details ? `${error.message}: ${details}` : error.message));
+          reject(buildAzCommandError(error, String(stderr ?? ""), String(stdout ?? "")));
           return;
         }
         resolve(String(stdout).trim());

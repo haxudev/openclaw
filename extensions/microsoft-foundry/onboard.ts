@@ -11,13 +11,15 @@ import {
   type AzAccount,
   type AzCognitiveAccount,
   type AzDeploymentSummary,
+  type FoundryProviderApi,
   type FoundryResourceOption,
   type FoundrySelection,
   buildFoundryProviderBaseUrl,
   extractFoundryEndpoint,
-  resolveConfiguredModelNameHint,
-  resolveFoundryApi,
+  requiresFoundryMaxCompletionTokens,
+  DEFAULT_API,
   DEFAULT_GPT5_API,
+  usesFoundryResponsesByDefault,
 } from "./shared.js";
 
 export { listSubscriptions } from "./cli.js";
@@ -186,6 +188,51 @@ export async function selectFoundryDeployment(
   );
 }
 
+async function promptFoundryApi(
+  ctx: ProviderAuthContext,
+  initialApi: FoundryProviderApi,
+): Promise<FoundryProviderApi> {
+  return await ctx.prompter.select({
+    message: "Select request API",
+    options: [
+      {
+        value: DEFAULT_GPT5_API,
+        label: "Responses API",
+        hint: "Recommended for Azure OpenAI GPT, o-series, and Codex deployments",
+      },
+      {
+        value: "openai-completions",
+        label: "Chat Completions API",
+        hint: "Use for Foundry models that only expose chat/completions semantics",
+      },
+    ],
+    initialValue: initialApi,
+  });
+}
+
+type ManualFoundryModelFamilyChoice = "reasoning-family" | "other-chat";
+
+async function promptFoundryModelFamily(
+  ctx: ProviderAuthContext,
+): Promise<ManualFoundryModelFamilyChoice> {
+  return await ctx.prompter.select({
+    message: "Model family",
+    options: [
+      {
+        value: "reasoning-family",
+        label: "GPT-5 series / o-series / Codex",
+        hint: "Use for Azure OpenAI reasoning and Codex deployments",
+      },
+      {
+        value: "other-chat",
+        label: "Other chat model",
+        hint: "Use for other chat/completions style Foundry models",
+      },
+    ],
+    initialValue: "reasoning-family",
+  });
+}
+
 async function promptEndpointAndModelBase(
   ctx: ProviderAuthContext,
   options?: {
@@ -222,17 +269,22 @@ async function promptEndpointAndModelBase(
       },
     }),
   ).trim();
-  const modelNameHintInput = String(
-    await ctx.prompter.text({
-      message: "Underlying Azure model family (optional)",
-      initialValue: modelId,
-      placeholder: "gpt-5.4, gpt-4o, etc.",
-    }),
-  ).trim();
+  const familyChoice = await promptFoundryModelFamily(ctx);
+  const resolvedModelName =
+    familyChoice === "reasoning-family"
+      ? usesFoundryResponsesByDefault(modelId) || requiresFoundryMaxCompletionTokens(modelId)
+        ? modelId
+        : "gpt-5"
+      : undefined;
+  const api = await promptFoundryApi(
+    ctx,
+    familyChoice === "reasoning-family" ? DEFAULT_GPT5_API : DEFAULT_API,
+  );
   return {
     endpoint,
     modelId,
-    modelNameHint: modelNameHintInput || modelId,
+    ...(resolvedModelName ? { modelNameHint: resolvedModelName } : {}),
+    api,
   };
 }
 
@@ -255,13 +307,15 @@ export function buildFoundryConnectionTest(params: {
   endpoint: string;
   modelId: string;
   modelNameHint?: string | null;
+  api: FoundryProviderApi;
 }): { url: string; body: Record<string, unknown> } {
   const baseUrl = buildFoundryProviderBaseUrl(
     params.endpoint,
     params.modelId,
     params.modelNameHint,
+    params.api,
   );
-  if (resolveFoundryApi(params.modelId, params.modelNameHint) === DEFAULT_GPT5_API) {
+  if (params.api === DEFAULT_GPT5_API) {
     return {
       url: `${baseUrl}/responses`,
       body: {
@@ -272,8 +326,9 @@ export function buildFoundryConnectionTest(params: {
     };
   }
   return {
-    url: `${baseUrl}/chat/completions?api-version=2024-12-01-preview`,
+    url: `${baseUrl}/chat/completions`,
     body: {
+      model: params.modelId,
       messages: [{ role: "user", content: "hi" }],
       max_tokens: 1,
     },
@@ -394,6 +449,7 @@ export async function testFoundryConnection(params: {
   endpoint: string;
   modelId: string;
   modelNameHint?: string;
+  api: FoundryProviderApi;
   subscriptionId?: string;
   tenantId?: string;
 }): Promise<void> {
@@ -406,7 +462,10 @@ export async function testFoundryConnection(params: {
       endpoint: params.endpoint,
       modelId: params.modelId,
       modelNameHint: params.modelNameHint,
+      api: params.api,
     });
+    const signal =
+      typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(15_000) : undefined;
     const res = await fetch(testRequest.url, {
       method: "POST",
       headers: {
@@ -414,6 +473,7 @@ export async function testFoundryConnection(params: {
         "Content-Type": "application/json",
       },
       body: JSON.stringify(testRequest.body),
+      ...(signal ? { signal } : {}),
     });
     if (res.status === 400) {
       const body = await res.text().catch(() => "");

@@ -25,9 +25,11 @@ import {
 } from "./onboard.js";
 import {
   buildFoundryAuthResult,
+  type FoundryProviderApi,
   listConfiguredFoundryProfileIds,
   PROVIDER_ID,
   resolveConfiguredModelNameHint,
+  resolveFoundryApi,
 } from "./shared.js";
 
 export const entraIdAuthMethod: ProviderAuthMethod = {
@@ -103,10 +105,12 @@ export const entraIdAuthMethod: ProviderAuthMethod = {
     let endpoint: string;
     let modelId: string;
     let modelNameHint: string | undefined;
+    let api: FoundryProviderApi;
     let discoveredDeployments:
       | Array<{
           name: string;
           modelName?: string;
+          api?: "openai-completions" | "openai-responses";
         }>
       | undefined;
     if (selectedSub) {
@@ -125,26 +129,29 @@ export const entraIdAuthMethod: ProviderAuthMethod = {
         discoveredDeployments = resourceDeployments.map((deployment) => ({
           name: deployment.name,
           ...(deployment.modelName ? { modelName: deployment.modelName } : {}),
+          api: resolveFoundryApi(deployment.name, deployment.modelName),
         }));
         endpoint = selectedResource.endpoint;
         modelId = selectedDeployment.name;
         modelNameHint = resolveConfiguredModelNameHint(modelId, selectedDeployment.modelName);
+        api = resolveFoundryApi(modelId, modelNameHint);
         await ctx.prompter.note(
           [
             `Resource: ${selectedResource.accountName}`,
             `Endpoint: ${endpoint}`,
             `Deployment: ${modelId}`,
             selectedDeployment.modelName ? `Model: ${selectedDeployment.modelName}` : undefined,
+            `API: ${api === "openai-responses" ? "Responses" : "Chat Completions"}`,
           ]
             .filter(Boolean)
             .join("\n"),
           "Microsoft Foundry",
         );
       } else {
-        ({ endpoint, modelId, modelNameHint } = await promptEndpointAndModelManually(ctx));
+        ({ endpoint, modelId, modelNameHint, api } = await promptEndpointAndModelManually(ctx));
       }
     } else {
-      ({ endpoint, modelId, modelNameHint } = await promptEndpointAndModelManually(ctx));
+      ({ endpoint, modelId, modelNameHint, api } = await promptEndpointAndModelManually(ctx));
     }
 
     await testFoundryConnection({
@@ -152,6 +159,7 @@ export const entraIdAuthMethod: ProviderAuthMethod = {
       endpoint,
       modelId,
       modelNameHint,
+      api,
       subscriptionId: selectedSub?.id,
       tenantId,
     });
@@ -162,6 +170,7 @@ export const entraIdAuthMethod: ProviderAuthMethod = {
       endpoint,
       modelId,
       modelNameHint,
+      api,
       authMethod: "entra-id",
       ...(selectedSub?.id ? { subscriptionId: selectedSub.id } : {}),
       ...(selectedSub?.name ? { subscriptionName: selectedSub.name } : {}),
@@ -234,6 +243,7 @@ export const apiKeyAuthMethod: ProviderAuthMethod = {
       modelId: selection.modelId,
       modelNameHint:
         selection.modelNameHint ?? existingMetadata?.modelName ?? existingMetadata?.modelId,
+      api: selection.api,
       authMethod: "api-key",
       currentProviderProfileIds: listConfiguredFoundryProfileIds(ctx.config),
       currentPluginsAllow: ctx.config.plugins?.allow,

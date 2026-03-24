@@ -4,7 +4,7 @@ import {
   type ProviderAuthResult,
   type SecretInput,
 } from "openclaw/plugin-sdk/provider-auth";
-import type { ModelProviderConfig } from "openclaw/plugin-sdk/provider-models";
+import type { ModelApi, ModelProviderConfig } from "openclaw/plugin-sdk/provider-models";
 
 export const PROVIDER_ID = "microsoft-foundry";
 export const DEFAULT_API = "openai-completions";
@@ -59,6 +59,7 @@ export type FoundrySelection = {
   endpoint: string;
   modelId: string;
   modelNameHint?: string;
+  api: FoundryProviderApi;
 };
 
 export type CachedTokenEntry = {
@@ -71,9 +72,11 @@ export type FoundryProviderApi = typeof DEFAULT_API | typeof DEFAULT_GPT5_API;
 export type FoundryDeploymentConfigInput = {
   name: string;
   modelName?: string;
+  api?: FoundryProviderApi;
 };
 
 type FoundryModelCompat = {
+  supportsStore?: boolean;
   maxTokensField: "max_completion_tokens" | "max_tokens";
 };
 
@@ -93,26 +96,60 @@ type FoundryConfigShape = {
   };
 };
 
-export function isGpt5FamilyName(value?: string | null): boolean {
-  return typeof value === "string" && /^gpt-5(?:$|[-.])/i.test(value.trim());
+export function normalizeFoundryModelName(value?: string | null): string | undefined {
+  const trimmed = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return trimmed || undefined;
 }
 
-export function isGpt5FamilyDeployment(modelId: string, modelNameHint?: string | null): boolean {
-  return isGpt5FamilyName(modelId) || isGpt5FamilyName(modelNameHint);
+export function usesFoundryResponsesByDefault(value?: string | null): boolean {
+  const normalized = normalizeFoundryModelName(value);
+  if (!normalized) {
+    return false;
+  }
+  return (
+    normalized.startsWith("gpt-") ||
+    normalized.startsWith("o1") ||
+    normalized.startsWith("o3") ||
+    normalized.startsWith("o4") ||
+    normalized === "computer-use-preview"
+  );
+}
+
+export function requiresFoundryMaxCompletionTokens(value?: string | null): boolean {
+  const normalized = normalizeFoundryModelName(value);
+  if (!normalized) {
+    return false;
+  }
+  return (
+    normalized.startsWith("gpt-5") ||
+    normalized.startsWith("o1") ||
+    normalized.startsWith("o3") ||
+    normalized.startsWith("o4")
+  );
+}
+
+export function isFoundryProviderApi(value?: string | null): value is FoundryProviderApi {
+  return value === DEFAULT_API || value === DEFAULT_GPT5_API;
 }
 
 export function normalizeFoundryEndpoint(endpoint: string): string {
-  const trimmed = endpoint.trim().replace(/\/+$/, "");
-  return trimmed.replace(/\/openai(?:\/v1|\/deployments\/[^/]+)?$/i, "");
+  const trimmed = endpoint.trim();
+  if (!trimmed) {
+    return trimmed;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    parsed.search = "";
+    parsed.hash = "";
+    const normalizedPath = parsed.pathname.replace(/\/openai(?:$|\/).*/i, "").replace(/\/+$/, "");
+    return `${parsed.origin}${normalizedPath && normalizedPath !== "/" ? normalizedPath : ""}`;
+  } catch {
+    const withoutQuery = trimmed.replace(/[?#].*$/, "").replace(/\/+$/, "");
+    return withoutQuery.replace(/\/openai(?:$|\/).*/i, "");
+  }
 }
 
-export function buildAzureBaseUrl(endpoint: string, modelId: string): string {
-  const base = normalizeFoundryEndpoint(endpoint);
-  if (base.includes("/openai/deployments/")) return base;
-  return `${base}/openai/deployments/${modelId}`;
-}
-
-export function buildFoundryResponsesBaseUrl(endpoint: string): string {
+export function buildFoundryV1BaseUrl(endpoint: string): string {
   const base = normalizeFoundryEndpoint(endpoint);
   return base.endsWith("/openai/v1") ? base : `${base}/openai/v1`;
 }
@@ -120,18 +157,22 @@ export function buildFoundryResponsesBaseUrl(endpoint: string): string {
 export function resolveFoundryApi(
   modelId: string,
   modelNameHint?: string | null,
+  configuredApi?: ModelApi | string | null,
 ): FoundryProviderApi {
-  return isGpt5FamilyDeployment(modelId, modelNameHint) ? DEFAULT_GPT5_API : DEFAULT_API;
+  if (isFoundryProviderApi(configuredApi)) {
+    return configuredApi;
+  }
+  const configuredModelName = resolveConfiguredModelNameHint(modelId, modelNameHint);
+  return usesFoundryResponsesByDefault(configuredModelName) ? DEFAULT_GPT5_API : DEFAULT_API;
 }
 
 export function buildFoundryProviderBaseUrl(
   endpoint: string,
   modelId: string,
   modelNameHint?: string | null,
+  configuredApi?: ModelApi | string | null,
 ): string {
-  return resolveFoundryApi(modelId, modelNameHint) === DEFAULT_GPT5_API
-    ? buildFoundryResponsesBaseUrl(endpoint)
-    : buildAzureBaseUrl(endpoint, modelId);
+  return buildFoundryV1BaseUrl(endpoint);
 }
 
 export function extractFoundryEndpoint(baseUrl: string | null | undefined): string | undefined {
@@ -139,7 +180,7 @@ export function extractFoundryEndpoint(baseUrl: string | null | undefined): stri
     return undefined;
   }
   try {
-    return new URL(baseUrl).origin;
+    return normalizeFoundryEndpoint(baseUrl);
   } catch {
     return undefined;
   }
@@ -148,12 +189,17 @@ export function extractFoundryEndpoint(baseUrl: string | null | undefined): stri
 export function buildFoundryModelCompat(
   modelId: string,
   modelNameHint?: string | null,
+  configuredApi?: ModelApi | string | null,
 ): FoundryModelCompat | undefined {
-  if (!isGpt5FamilyDeployment(modelId, modelNameHint)) {
+  const resolvedApi = resolveFoundryApi(modelId, modelNameHint, configuredApi);
+  const configuredModelName = resolveConfiguredModelNameHint(modelId, modelNameHint);
+  const needsMaxCompletionTokens = requiresFoundryMaxCompletionTokens(configuredModelName);
+  if (resolvedApi !== DEFAULT_GPT5_API && !needsMaxCompletionTokens) {
     return undefined;
   }
   return {
-    maxTokensField: "max_completion_tokens" as const,
+    ...(resolvedApi === DEFAULT_GPT5_API ? { supportsStore: false } : {}),
+    maxTokensField: needsMaxCompletionTokens ? "max_completion_tokens" : "max_tokens",
   };
 }
 
@@ -174,6 +220,7 @@ export function buildFoundryProviderConfig(
   modelId: string,
   modelNameHint?: string | null,
   options?: {
+    api?: FoundryProviderApi;
     authMethod?: "api-key" | "entra-id";
     apiKey?: SecretInput;
     deployments?: FoundryDeploymentConfigInput[];
@@ -184,9 +231,10 @@ export function buildFoundryProviderConfig(
   const deployments = options?.deployments?.length
     ? options.deployments
     : [{ name: modelId, modelName: modelNameHint ?? undefined }];
+  const resolvedApi = resolveFoundryApi(modelId, modelNameHint, options?.api);
   return {
-    baseUrl: buildFoundryProviderBaseUrl(endpoint, modelId, modelNameHint),
-    api: resolveFoundryApi(modelId, modelNameHint),
+    baseUrl: buildFoundryProviderBaseUrl(endpoint, modelId, modelNameHint, resolvedApi),
+    api: resolvedApi,
     ...(isApiKeyAuth
       ? {
           authHeader: false,
@@ -197,10 +245,12 @@ export function buildFoundryProviderConfig(
       : {}),
     models: deployments.map((deployment) => {
       const configuredName = resolveConfiguredModelNameHint(deployment.name, deployment.modelName);
-      const compat = buildFoundryModelCompat(deployment.name, configuredName);
+      const api = resolveFoundryApi(deployment.name, configuredName, deployment.api);
+      const compat = buildFoundryModelCompat(deployment.name, configuredName, api);
       return {
         id: deployment.name,
         name: configuredName ?? deployment.name,
+        api,
         reasoning: false,
         input: ["text"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -217,14 +267,17 @@ function buildFoundryCredentialMetadata(params: {
   endpoint: string;
   modelId: string;
   modelNameHint?: string | null;
+  api?: FoundryProviderApi;
   subscriptionId?: string;
   subscriptionName?: string;
   tenantId?: string;
 }): Record<string, string> {
+  const resolvedApi = resolveFoundryApi(params.modelId, params.modelNameHint, params.api);
   const metadata: Record<string, string> = {
     authMethod: params.authMethod,
     endpoint: params.endpoint,
     modelId: params.modelId,
+    api: resolvedApi,
   };
   const modelName = resolveConfiguredModelNameHint(params.modelId, params.modelNameHint);
   if (modelName) {
@@ -291,6 +344,7 @@ export function buildFoundryAuthResult(params: {
   endpoint: string;
   modelId: string;
   modelNameHint?: string | null;
+  api: FoundryProviderApi;
   authMethod: "api-key" | "entra-id";
   subscriptionId?: string;
   subscriptionName?: string;
@@ -313,6 +367,7 @@ export function buildFoundryAuthResult(params: {
             endpoint: params.endpoint,
             modelId: params.modelId,
             modelNameHint: params.modelNameHint,
+            api: params.api,
             subscriptionId: params.subscriptionId,
             subscriptionName: params.subscriptionName,
             tenantId: params.tenantId,
@@ -333,6 +388,7 @@ export function buildFoundryAuthResult(params: {
             params.modelId,
             params.modelNameHint,
             {
+              api: params.api,
               authMethod: params.authMethod,
               apiKey: params.apiKey,
               deployments: params.deployments,

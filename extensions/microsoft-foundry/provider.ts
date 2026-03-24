@@ -9,6 +9,7 @@ import {
   buildFoundryModelCompat,
   buildFoundryProviderBaseUrl,
   extractFoundryEndpoint,
+  isFoundryProviderApi,
   normalizeFoundryEndpoint,
   resolveConfiguredModelNameHint,
   resolveFoundryApi,
@@ -38,12 +39,22 @@ export function buildMicrosoftFoundryProvider(): ProviderPlugin {
         selectedModelId,
         existingModel?.name,
       );
-      const selectedModelCompat = buildFoundryModelCompat(selectedModelId, selectedModelNameHint);
       const providerEndpoint = normalizeFoundryEndpoint(providerConfig.baseUrl ?? "");
+      // Prefer the persisted per-model API choice from onboarding/discovery so arbitrary
+      // deployment aliases (for example prod-primary) do not fall back to name heuristics.
+      const selectedModelApi = isFoundryProviderApi(existingModel?.api)
+        ? existingModel.api
+        : providerConfig.api;
+      const selectedModelCompat = buildFoundryModelCompat(
+        selectedModelId,
+        selectedModelNameHint,
+        selectedModelApi,
+      );
       const nextModels = providerConfig.models.map((model) =>
         model.id === selectedModelId
           ? {
               ...model,
+              api: resolveFoundryApi(selectedModelId, selectedModelNameHint, selectedModelApi),
               ...(selectedModelCompat ? { compat: selectedModelCompat } : {}),
             }
           : model,
@@ -52,6 +63,7 @@ export function buildMicrosoftFoundryProvider(): ProviderPlugin {
         nextModels.push({
           id: selectedModelId,
           name: selectedModelNameHint ?? selectedModelId,
+          api: resolveFoundryApi(selectedModelId, selectedModelNameHint, selectedModelApi),
           reasoning: false,
           input: ["text"],
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -66,8 +78,9 @@ export function buildMicrosoftFoundryProvider(): ProviderPlugin {
           providerEndpoint,
           selectedModelId,
           selectedModelNameHint,
+          selectedModelApi,
         ),
-        api: resolveFoundryApi(selectedModelId, selectedModelNameHint),
+        api: resolveFoundryApi(selectedModelId, selectedModelNameHint, selectedModelApi),
         models: nextModels,
       };
       const targetProfileId = resolveFoundryTargetProfileId(ctx.config);
@@ -82,11 +95,12 @@ export function buildMicrosoftFoundryProvider(): ProviderPlugin {
         return model;
       }
       const modelNameHint = resolveConfiguredModelNameHint(modelId, model.name);
-      const compat = buildFoundryModelCompat(modelId, modelNameHint);
+      const configuredApi = isFoundryProviderApi(model.api) ? model.api : undefined;
+      const compat = buildFoundryModelCompat(modelId, modelNameHint, configuredApi);
       return {
         ...model,
-        api: resolveFoundryApi(modelId, modelNameHint),
-        baseUrl: buildFoundryProviderBaseUrl(endpoint, modelId, modelNameHint),
+        api: resolveFoundryApi(modelId, modelNameHint, configuredApi),
+        baseUrl: buildFoundryProviderBaseUrl(endpoint, modelId, modelNameHint, configuredApi),
         ...(compat ? { compat } : {}),
       };
     },
